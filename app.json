@@ -1,0 +1,60 @@
+{
+  "expo": {
+    "name": "OMGReadX",
+    "slug": "OMGReadX",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/readx.jpeg",
+    "scheme": "omgreadx",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "com.onemay.omgreadx",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "We need access to your photo library to set your profile picture.",
+        "NSPhotoLibraryAddUsageDescription": "We need access to save profile pictures to your photo library.",
+        "NSCameraUsageDescription": "We need camera access for eye-tracking to automatically detect when you've finished reading each line."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/images/readx.jpeg"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "CAMERA",
+        "CAMERA"
+      ],
+      "package": "com.onemay.omgreadx"
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/readx.jpeg",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/readx.jpeg",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#ffffff",
+          "dark": {
+            "backgroundColor": "#000000"
+          }
+        }
+      ],
+      "expo-font",
+      "expo-web-browser"
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}
