@@ -15,7 +15,8 @@ export function detectFileType(filename: string): FileType {
   if (['txt', 'md', 'json', 'xml', 'html', 'htm', 'csv'].includes(ext)) return 'txt';
   if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return 'image';
   
-  return 'unsupported';
+  // For any other file format, try to read as text
+  return 'txt';
 }
 
 /**
@@ -45,131 +46,195 @@ export async function convertFileToText(fileUri: string, filename: string): Prom
     }
     
     default:
-      throw new Error(`Unsupported file type: ${type}`);
+      // For any unknown file type, try to read as plain text
+      console.log(`[FileConverter] Unknown file type "${type}", attempting to read as text...`);
+      return await extractTextFromTXT(fileUri);
   }
 }
 
 /**
- * Extract text from PDF using pdfjs-dist (for text PDFs)
- * Falls back to suggesting OCR for scanned PDFs
+ * Extract text from PDF using backend API
+ * Falls back to local extraction if backend is unavailable
  */
 async function extractTextFromPDF(fileUri: string): Promise<string> {
-  // On mobile, try to use pdf-parse as a fallback
-  if (Platform.OS !== 'web') {
-    try {
-      console.log('[FileConverter] Attempting PDF extraction on mobile using pdf-parse...');
-      const pdfParse = (await import('pdf-parse')).default;
-      
-      // Read file as buffer
-      let fileBuffer: Buffer;
-      try {
-        const fileBase64 = await FileSystem.readAsStringAsync(fileUri, {
-          encoding: 'base64',
-        } as any);
-        fileBuffer = Buffer.from(fileBase64, 'base64');
-      } catch (readError: any) {
-        throw new Error(`Failed to read PDF file: ${readError.message || 'Unknown error'}`);
-      }
-      
-      const data = await pdfParse(fileBuffer);
-      const extractedText = data.text.trim();
-      
-      if (!extractedText || extractedText.length < 50) {
-        throw new Error('PDF appears to be scanned with no extractable text. Please convert to DOCX or TXT format.');
-      }
-      
-      console.log(`[FileConverter] Successfully extracted ${extractedText.length} characters from PDF on mobile`);
-      return extractedText;
-    } catch (mobileError: any) {
-      console.error('[FileConverter] Mobile PDF extraction failed:', mobileError);
-      throw new Error(`PDF text extraction is not available on mobile: ${mobileError.message || 'Unknown error'}. Please convert PDF to DOCX or TXT format.`);
-    }
-  }
+  const BACKEND_URL = 'https://readx-backend-360873415676.asia-south1.run.app';
   
   try {
-    console.log('[FileConverter] Extracting text from PDF using pdfjs-dist...');
-    const pdfjsLib = await import('pdfjs-dist');
+    console.log('[FileConverter] Attempting PDF extraction using backend API...');
     
-    // Configure worker for web
-    pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+    // Send PDF to backend API
+    const formData = new FormData();
+    let tempFileUri: string | null = null;
+    let useDirectUri = false;
     
-    // Load PDF file
-    let pdfData: ArrayBuffer;
-    
-    // Check if it's a data URI (base64 encoded)
-    if (fileUri.startsWith('data:application/pdf;base64,')) {
-      console.log('[FileConverter] Detected base64 data URI for PDF');
-      const base64Data = fileUri.split(',')[1];
-      const binaryString = atob(base64Data);
+    if (Platform.OS === 'web') {
+      // Web: Convert to base64 then to Blob
+      let pdfBase64: string;
+      
+      if (fileUri.startsWith('data:application/pdf;base64,')) {
+        console.log('[FileConverter] Detected base64 data URI for PDF');
+        pdfBase64 = fileUri.split(',')[1];
+      } else if (fileUri.startsWith('data:')) {
+        // Generic data URI - try to extract base64
+        console.log('[FileConverter] Detected generic data URI, attempting to extract base64');
+        const base64Match = fileUri.match(/data:[^;]*;base64,(.+)/);
+        if (base64Match) {
+          pdfBase64 = base64Match[1];
+        } else {
+          throw new Error('Invalid data URI format for PDF');
+        }
+      } else {
+        // Try fetch for web
+        try {
+          const response = await fetch(fileUri);
+          const blob = await response.blob();
+          const arrayBuffer = await blob.arrayBuffer();
+          const binaryString = String.fromCharCode(...new Uint8Array(arrayBuffer));
+          pdfBase64 = btoa(binaryString);
+        } catch (fetchError: any) {
+          throw new Error(`Failed to read PDF file: ${fetchError.message || 'Unknown error'}`);
+        }
+      }
+      
+      // Create Blob from base64
+      const binaryString = atob(pdfBase64);
       const bytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) {
         bytes[i] = binaryString.charCodeAt(i);
       }
-      pdfData = bytes.buffer;
-    } else if (fileUri.startsWith('data:')) {
-      // Generic data URI - try to extract base64
-      console.log('[FileConverter] Detected generic data URI, attempting to extract base64');
-      const base64Match = fileUri.match(/data:[^;]*;base64,(.+)/);
-      if (base64Match) {
-        const base64Data = base64Match[1];
-        const binaryString = atob(base64Data);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        pdfData = bytes.buffer;
-      } else {
-        throw new Error('Invalid data URI format for PDF');
-      }
+      const blob = new Blob([bytes], { type: 'application/pdf' });
+      formData.append('file', blob, 'document.pdf');
     } else {
-      try {
-        const response = await fetch(fileUri);
-        pdfData = await response.arrayBuffer();
-      } catch {
-        // Fallback: read as base64
-        const fileBase64 = await FileSystem.readAsStringAsync(fileUri, {
-          encoding: 'base64',
-        } as any);
-        const binaryString = atob(fileBase64);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
+      // React Native: Use file URI directly if it's a file path, otherwise convert from base64
+      if (fileUri.startsWith('data:')) {
+        // Data URI: Convert to temp file
+        let pdfBase64: string;
+        
+        if (fileUri.startsWith('data:application/pdf;base64,')) {
+          pdfBase64 = fileUri.split(',')[1];
+        } else {
+          const base64Match = fileUri.match(/data:[^;]*;base64,(.+)/);
+          if (base64Match) {
+            pdfBase64 = base64Match[1];
+          } else {
+            throw new Error('Invalid data URI format for PDF');
+          }
         }
-        pdfData = bytes.buffer;
+        
+        // Write base64 to temp file
+        const tempFileName = `temp_pdf_${Date.now()}.pdf`;
+        tempFileUri = `${FileSystem.cacheDirectory}${tempFileName}`;
+        
+        await FileSystem.writeAsStringAsync(tempFileUri, pdfBase64, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+        
+        formData.append('file', {
+          uri: tempFileUri,
+          type: 'application/pdf',
+          name: 'document.pdf',
+        } as any);
+      } else {
+        // File URI: Use directly
+        console.log('[FileConverter] Using file URI directly for React Native');
+        useDirectUri = true;
+        formData.append('file', {
+          uri: fileUri,
+          type: 'application/pdf',
+          name: 'document.pdf',
+        } as any);
       }
     }
     
-    // Parse PDF
-    const loadingTask = pdfjsLib.getDocument({ 
-      data: pdfData, 
-      useWorkerFetch: false,
-      isEvalSupported: false,
-      useSystemFonts: true,
-    });
-    const pdf = await loadingTask.promise;
+    // Call backend API with timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout
     
-    console.log(`[FileConverter] Extracting text from ${pdf.numPages} PDF pages...`);
-    
-    // Extract text from all pages
-    let fullText = '';
-    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const textContent = await page.getTextContent();
-      const pageText = textContent.items
-        .map((item: any) => item.str)
-        .join(' ');
-      fullText += pageText + '\n\n';
+    try {
+      const response = await fetch(`${BACKEND_URL}/extract/pdf`, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
+      
+      clearTimeout(timeoutId);
+      
+      // Clean up temp file if created (only temp files, not original file URIs)
+      if (tempFileUri && !useDirectUri) {
+        try {
+          await FileSystem.deleteAsync(tempFileUri, { idempotent: true });
+        } catch (cleanupError) {
+          console.warn('[FileConverter] Failed to cleanup temp file:', cleanupError);
+        }
+      }
+      
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unknown error');
+        let errorDetails = errorText;
+        try {
+          const errorJson = JSON.parse(errorText);
+          errorDetails = errorJson.error || errorJson.message || errorText;
+        } catch {
+          // Not JSON, use as-is
+        }
+        // Include status code in error message for better error handling
+        throw new Error(`Backend API error: ${response.status} - ${errorDetails}`);
+      }
+      
+      // Parse JSON response (backend returns { source, pages, text })
+      let extractedText: string;
+      const contentType = response.headers.get('content-type') || '';
+      
+      if (contentType.includes('application/json')) {
+        const result = await response.json();
+        // Backend returns { source: "text-pdf" | "ocr-pdf", pages: number, text: string }
+        extractedText = result.text || result.data || result.content || (typeof result === 'string' ? result : JSON.stringify(result));
+      } else {
+        // Fallback: assume plain text response
+        extractedText = await response.text();
+      }
+      
+      if (typeof extractedText !== 'string') {
+        throw new Error('Backend returned invalid response format');
+      }
+      
+      const text = extractedText.trim();
+      
+      if (!text || text.length === 0) {
+        throw new Error('Backend returned empty text. PDF may be scanned or unreadable.');
+      }
+      
+      console.log(`[FileConverter] Successfully extracted ${text.length} characters from PDF using backend API`);
+      return text;
+    } catch (fetchError: any) {
+      clearTimeout(timeoutId);
+      
+      // Clean up temp file on error (only temp files, not original file URIs)
+      if (tempFileUri && !useDirectUri) {
+        try {
+          await FileSystem.deleteAsync(tempFileUri, { idempotent: true });
+        } catch (cleanupError) {
+          console.warn('[FileConverter] Failed to cleanup temp file on error:', cleanupError);
+        }
+      }
+      
+      if (fetchError.name === 'AbortError') {
+        throw new Error('Backend API request timeout after 60 seconds. The file may be too large or the backend is not responding. Please check your connection and try again.');
+      }
+      
+      // If backend fails, throw error (don't fallback to local extraction)
+      console.error('[FileConverter] Backend API error:', fetchError);
+      
+      // Check for network/connection errors
+      if (fetchError.message?.includes('Network request failed') || 
+          fetchError.message?.includes('Failed to connect') ||
+          fetchError.message?.includes('ECONNREFUSED') ||
+          fetchError.message?.includes('ENOTFOUND')) {
+        throw new Error(`Cannot connect to backend server at ${BACKEND_URL}. Please ensure the backend is running and accessible on your network.`);
+      }
+      
+      throw new Error(`Backend PDF extraction failed: ${fetchError.message || 'Unknown error'}. Please ensure the backend is running at ${BACKEND_URL}`);
     }
-    
-    const extractedText = fullText.trim();
-    
-    // Check if we got meaningful text
-    if (!extractedText || extractedText.length < 50) {
-      throw new Error('PDF appears to be scanned with no extractable text. Please convert to DOCX or TXT format, or use a PDF with selectable text.');
-    }
-    
-    console.log(`[FileConverter] Successfully extracted ${extractedText.length} characters from PDF`);
-    return extractedText;
   } catch (error: any) {
     console.error('[FileConverter] PDF extraction error:', error);
     throw new Error(`PDF extraction failed: ${error.message || 'Unknown error'}`);
@@ -266,43 +331,43 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
     }
     
     // Extract text using mammoth with timeout
-    // Use convertToMarkdown for better spacing preservation, fallback to extractRawText
+    // Use convertToHtml for better formatting preservation, fallback to extractRawText
     let extractedText = '';
     
     try {
-      // Try convertToMarkdown first (preserves spacing better)
-      const markdownPromise = mammoth.convertToMarkdown({ arrayBuffer });
+      // Try convertToHtml first (preserves formatting better)
+      const htmlPromise = mammoth.convertToHtml({ arrayBuffer });
       const timeoutPromise = new Promise<never>((_, reject) => 
         setTimeout(() => reject(new Error('DOCX text extraction timeout')), 30000)
       );
       
-      const markdownResult = await Promise.race([markdownPromise, timeoutPromise]);
-      if (markdownResult.value && markdownResult.value.trim().length > 0) {
-        // Convert markdown to plain text while preserving spacing
-        extractedText = markdownResult.value
-          // Replace markdown headers with newlines
-          .replace(/^#+\s+/gm, '')
-          // Replace markdown bold/italic with plain text
-          .replace(/\*\*([^*]+)\*\*/g, '$1')
-          .replace(/\*([^*]+)\*/g, '$1')
-          .replace(/__([^_]+)__/g, '$1')
-          .replace(/_([^_]+)_/g, '$1')
-          // Replace markdown links with just the text
-          .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1')
+      const htmlResult = await Promise.race([htmlPromise, timeoutPromise]);
+      if (htmlResult.value && htmlResult.value.trim().length > 0) {
+        // Convert HTML to plain text while preserving spacing
+        extractedText = htmlResult.value
+          // Remove HTML tags
+          .replace(/<[^>]+>/g, ' ')
+          // Replace HTML entities
+          .replace(/&nbsp;/g, ' ')
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'")
           // Remove forward slashes and backslashes
           .replace(/\//g, ' ')
           .replace(/\\/g, ' ')
           // Normalize whitespace: preserve line breaks, but normalize spaces within lines
           .split('\n')
-          .map(line => line.trim().replace(/\s+/g, ' '))
+          .map((line: string) => line.trim().replace(/\s+/g, ' '))
           .join('\n')
           .trim();
       }
-    } catch (markdownError) {
-      console.warn('[FileConverter] Markdown conversion failed, trying extractRawText...', markdownError);
+    } catch (htmlError) {
+      console.warn('[FileConverter] HTML conversion failed, trying extractRawText...', htmlError);
     }
     
-    // Fallback to extractRawText if markdown conversion failed or produced empty result
+    // Fallback to extractRawText if HTML conversion failed or produced empty result
     if (!extractedText || extractedText.trim().length === 0) {
       const extractPromise = mammoth.extractRawText({ arrayBuffer });
       const timeoutPromise = new Promise<never>((_, reject) => 

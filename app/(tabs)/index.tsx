@@ -103,8 +103,8 @@ export default function HomeScreen() {
       );
     }
     
-    const fileExt = selectedFile.name.split('.').pop()?.toLowerCase() || '';
-    const isReadableFile = ['txt', 'md', 'docx', 'doc', 'pdf'].includes(fileExt);
+    // Accept any file format for reading
+    const isReadableFile = true;
     
     if (readingMode && isReadableFile) {
       return (

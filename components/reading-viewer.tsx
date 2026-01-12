@@ -508,17 +508,23 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
         console.warn('[ReadingViewer] Could not load saved progress:', progressError);
       }
 
+      // Validate file format before attempting conversion
+      const { getFileExtension } = await import('@/utils/fileUtils');
+      const fileExt = getFileExtension(filename).toLowerCase();
+      const supportedFormats = ['pdf', 'doc', 'docx', 'txt', 'rtf'];
+      
+      if (!supportedFormats.includes(fileExt)) {
+        const ext = fileExt.toUpperCase() || 'Unknown';
+        setError(`Unsupported file format: "${ext}".\n\nSupported formats: PDF, DOC, DOCX, TXT, RTF only.\n\nPlease upload a file in one of these formats.`);
+        setLoading(false);
+        return;
+      }
+
       // Use the centralized file converter utility
       const { convertFileToText, detectFileType } = await import('@/utils/fileConverter');
       
       const fileType = detectFileType(filename);
       console.log(`[ReadingViewer] Detected file type: ${fileType}`);
-      
-      if (fileType === 'unsupported') {
-        setError('File type not supported for reading. Supported formats: TXT, MD, DOCX, PDF, and images (JPG, PNG, etc.).');
-        setLoading(false);
-        return;
-      }
       
       // Convert file to text using the utility with timeout
       let textContent: string;
@@ -537,7 +543,24 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
       } catch (conversionError: any) {
         console.error('[ReadingViewer] File conversion error:', conversionError);
         const errorMessage = conversionError?.message || 'Failed to extract text from file';
-        setError(`File reading error: ${errorMessage}. Please ensure the file is not corrupted and try again.`);
+        
+        // Check if it's a backend API error with 500 status (PDF extraction failed)
+        if (errorMessage.includes('Backend API error: 500') || 
+            (errorMessage.includes('Backend API error') && errorMessage.includes('PDF extraction failed'))) {
+          // Show user-friendly format error message
+          setError('This file format is not supported. Upload a correct PDF format without images.');
+        } else if (errorMessage.includes('Backend API request timeout') ||
+                   errorMessage.includes('Cannot connect to backend server') ||
+                   (errorMessage.includes('Backend PDF extraction failed') && !errorMessage.includes('500'))) {
+          // Show backend connection error for timeouts and connection issues
+          setError(`Backend connection failed.\n\n${errorMessage}\n\nPlease ensure:\n• The backend server is running at https://readx-backend-360873415676.asia-south1.run.app\n• Your device has internet connectivity\n• The backend service is accessible`);
+        } else if (errorMessage.includes('Unsupported file format') || errorMessage.includes('format is not supported')) {
+          // Format validation error (already handled)
+          setError(errorMessage);
+        } else {
+          // Other file reading errors
+          setError(`File reading error: ${errorMessage}. Please ensure the file is not corrupted and try again.`);
+        }
         setLoading(false);
         return;
       }

@@ -47,27 +47,8 @@ export const formatFileSize = (bytes: number): string => {
 };
 
 export const isReadableFormat = (filename: string): boolean => {
-  const ext = getFileExtension(filename);
-  const readableFormats = [
-    'pdf',
-    'epub',
-    'txt',
-    'doc',
-    'docx',
-    'rtf',
-    'md',
-    'jpg',
-    'jpeg',
-    'png',
-    'gif',
-    'webp',
-    'html',
-    'htm',
-    'xml',
-    'json',
-    'csv',
-  ];
-  return readableFormats.includes(ext);
+  // Accept any file format for reading
+  return true;
 };
 
 export const getStoragePath = (): string => {

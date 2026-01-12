@@ -1,7 +1,7 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Platform } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { saveFile } from './fileUtils';
+import { type FileInfo } from './fileUtils';
 import { addTextDocument, TextDocument } from './textDocumentsStorage';
 
 /**
@@ -142,7 +142,7 @@ export async function saveTextAsFile(text: string, title: string): Promise<{ uri
       console.log('[TextFileUtils] Adding file to metadata list...');
       try {
         const { addFileToList } = await import('./fileStorage');
-        const { FileInfo, getFileType } = await import('./fileUtils');
+        const { getFileType } = await import('./fileUtils');
         
         const fileInfoObj: FileInfo = {
           id: `${timestamp}-${filename}`,

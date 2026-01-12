@@ -2,7 +2,16 @@ import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, ActivityIndicator, Alert, StyleSheet } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import { Ionicons } from '@expo/vector-icons';
-import { saveFile, isReadableFormat, formatFileSize, getFileType } from '@/utils/fileUtils';
+import { saveFile, isReadableFormat, formatFileSize, getFileType, getFileExtension } from '@/utils/fileUtils';
+
+/**
+ * Check if file format is supported
+ */
+const isSupportedFormat = (filename: string): boolean => {
+  const ext = getFileExtension(filename).toLowerCase();
+  const supportedFormats = ['pdf', 'doc', 'docx', 'txt', 'rtf'];
+  return supportedFormats.includes(ext);
+};
 
 export interface UploadedFile {
   uri: string;
@@ -38,6 +47,18 @@ export default function FileUpload({ onFileUploaded }: FileUploadProps) {
 
       if (!file || !file.uri) {
         throw new Error('Invalid file selected');
+      }
+
+      // Validate file format
+      if (!isSupportedFormat(file.name)) {
+        const ext = getFileExtension(file.name).toUpperCase() || 'Unknown';
+        Alert.alert(
+          'Unsupported File Format',
+          `The file format "${ext}" is not supported.\n\nSupported formats: PDF, DOC, DOCX, TXT, RTF only.`,
+          [{ text: 'OK' }]
+        );
+        setUploading(false);
+        return;
       }
 
       let finalUri = file.uri;
@@ -129,7 +150,7 @@ export default function FileUpload({ onFileUploaded }: FileUploadProps) {
           </>
         )}
       </TouchableOpacity>
-      <Text style={styles.hint}>Any file format is accepted and saved for reading.</Text>
+      <Text style={styles.hint}>Supported formats: PDF, DOC, DOCX, TXT, RTF only</Text>
     </View>
   );
 }

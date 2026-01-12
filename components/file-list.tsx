@@ -148,7 +148,8 @@ export default function FileList({ refreshKey }: FileListProps) {
   if (selectedFile) {
     // Show reading mode for text-based files
     const fileExt = selectedFile.name.split('.').pop()?.toLowerCase() || '';
-    const isReadableFile = ['txt', 'md', 'docx', 'doc', 'pdf'].includes(fileExt);
+    // Accept any file format for reading
+    const isReadableFile = true;
     
     if (readingMode && isReadableFile) {
       return (
