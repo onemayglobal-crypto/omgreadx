@@ -1,166 +1,189 @@
-import React, { useState, useEffect } from 'react';
-import { SafeAreaView, View, StyleSheet, Text, TouchableOpacity, ScrollView, FlatList, Alert, ImageBackground } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { SafeAreaView, View, StyleSheet, Text, TouchableOpacity, FlatList, Alert, ImageBackground } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import FileUpload, { UploadedFile } from '@/components/file-upload';
-import FileViewer from '@/components/file-viewer';
 import ReadingViewer from '@/components/reading-viewer';
-import { getAllFiles, FileInfo } from '@/utils/fileUtils';
 import { ErrorBoundary } from '@/components/error-boundary';
-import { getFileReadingProgress } from '@/utils/readingStorage';
 import { useTheme } from '@/contexts/ThemeContext';
-import { getUserProfile } from '@/utils/profileStorage';
+import { useAuth } from '@/contexts/AuthContext';
+import { listenUserDocuments, type UserDocument } from '@/utils/firestoreDocuments';
+import { downloadJsonFromStoragePath } from '@/utils/firebaseStorageHelpers';
+import { upsertUserDocument } from '@/utils/firestoreDocuments';
+import { uploadJsonToStoragePath } from '@/utils/firebaseStorageHelpers';
+import * as FileSystem from 'expo-file-system/legacy';
 
 const backgroundImage = require('@/assets/images/dashboard.png');
 
 export default function HomeScreen() {
   const { theme, toggleTheme } = useTheme();
-  const [files, setFiles] = useState<FileInfo[]>([]);
-  const [selectedFile, setSelectedFile] = useState<FileInfo | null>(null);
-  const [readingMode, setReadingMode] = useState(false);
+  const { uid, userDoc } = useAuth();
+  const [docs, setDocs] = useState<Array<{ id: string; data: UserDocument }>>([]);
+  const [selectedDoc, setSelectedDoc] = useState<{ id: string; data: UserDocument } | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [fileProgressMap, setFileProgressMap] = useState<Map<string, { hasProgress: boolean; percentage: number }>>(new Map());
-  const [userName, setUserName] = useState<string | null>(null);
+  const processingRepairAttempted = useRef<Set<string>>(new Set());
+  const processingFirstSeen = useRef<Map<string, number>>(new Map());
   
   const isDark = theme === 'dark';
 
   // Refresh files when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
-      loadFiles();
-      loadUserProfile();
+      // realtime listener handles updates
     }, [])
   );
 
-  const loadUserProfile = async () => {
-    try {
-      const profile = await getUserProfile();
-      if (profile) {
-        setUserName(profile.displayName);
-      }
-    } catch (error) {
-      console.error('Error loading user profile:', error);
-    }
-  };
+  useEffect(() => {
+    if (!uid) return;
+    const unsub = listenUserDocuments(uid, setDocs);
+    return () => unsub();
+  }, [uid]);
 
-  const loadFiles = async () => {
-    try {
-      console.log('Loading files...');
-      const fileList = await getAllFiles();
-      console.log('Loaded files:', fileList.length);
-      setFiles(fileList);
-      
-      // Load reading progress for all files
-      const progressMap = new Map<string, { hasProgress: boolean; percentage: number }>();
-      for (const file of fileList) {
+  // Repair: if a doc is stuck in "processing" (e.g. app reloaded mid-upload),
+  // flip it to "ready" once processed JSON exists in Storage.
+  useEffect(() => {
+    if (!uid) return;
+    const run = async () => {
+      const candidates = docs.filter(
+        (d) =>
+          d.data.status === 'processing' &&
+          typeof d.data.processedPath === 'string' &&
+          d.data.processedPath.startsWith('users/') &&
+          d.data.processedPath.endsWith('.json')
+      );
+
+      for (const doc of candidates) {
+        if (!processingFirstSeen.current.has(doc.id)) {
+          processingFirstSeen.current.set(doc.id, Date.now());
+        }
+
+        if (processingRepairAttempted.current.has(doc.id)) continue;
+        processingRepairAttempted.current.add(doc.id);
+
         try {
-          const progress = await getFileReadingProgress(file.name, file.uri);
-          if (progress) {
-            const percentage = progress.totalParagraphs > 0
-              ? Math.round((progress.completedParagraphs.length / progress.totalParagraphs) * 100)
-              : 0;
-            progressMap.set(file.name, { hasProgress: true, percentage });
-          } else {
-            progressMap.set(file.name, { hasProgress: false, percentage: 0 });
+          // 1) If processed JSON exists, mark ready.
+          try {
+            const json = await downloadJsonFromStoragePath(doc.data.processedPath);
+            const text = typeof json?.text === 'string' ? json.text.trim() : '';
+            if (text) {
+              await upsertUserDocument({
+                uid,
+                docId: doc.id,
+                data: {
+                  type: doc.data.type,
+                  title: doc.data.title,
+                  pages: typeof json?.pages === 'number' ? json.pages : doc.data.pages || 1,
+                  status: 'ready',
+                  storagePath: doc.data.storagePath,
+                  processedPath: doc.data.processedPath,
+                },
+              });
+              continue;
+            }
+          } catch {
+            // processed not available yet
           }
-        } catch (error) {
-          console.warn('Error loading progress for file:', file.name, error);
-          progressMap.set(file.name, { hasProgress: false, percentage: 0 });
+
+          // 2) If non-PDF and processed is missing, attempt to rebuild processed JSON from original.
+          if (doc.data.type !== 'pdf' && doc.data.storagePath?.startsWith('users/')) {
+            const url = await (await import('firebase/storage')).getDownloadURL(
+              (await import('firebase/storage')).ref((await import('@/utils/firebaseConfig')).storage, doc.data.storagePath)
+            );
+            const resp = await fetch(url);
+            if (resp.ok) {
+              const ext = doc.data.storagePath.split('.').pop() || 'bin';
+              const tmp = `${FileSystem.cacheDirectory || FileSystem.documentDirectory}readx-repair-${doc.id}.${ext}`;
+              const blob = await resp.blob();
+              const ab = await blob.arrayBuffer();
+              const bytes = new Uint8Array(ab);
+              // write as base64
+              const { uint8ArrayToBase64 } = await import('@/utils/base64');
+              await FileSystem.writeAsStringAsync(tmp, uint8ArrayToBase64(bytes), {
+                encoding: FileSystem.EncodingType.Base64,
+              } as any);
+
+              try {
+                const { convertFileToText } = await import('@/utils/fileConverter');
+                const text = await convertFileToText(tmp, doc.data.title || doc.data.name);
+                await uploadJsonToStoragePath({
+                  storagePath: doc.data.processedPath,
+                  json: { pages: 1, text },
+                });
+                await upsertUserDocument({
+                  uid,
+                  docId: doc.id,
+                  data: {
+                    type: doc.data.type,
+                    title: doc.data.title,
+                    pages: 1,
+                    status: 'ready',
+                    storagePath: doc.data.storagePath,
+                    processedPath: doc.data.processedPath,
+                  },
+                });
+                continue;
+              } finally {
+                try {
+                  await FileSystem.deleteAsync(tmp, { idempotent: true } as any);
+                } catch {
+                  // ignore
+                }
+              }
+            }
+          }
+
+          // 3) If still processing after a while, mark error so UI doesn't get stuck.
+          const createdAt: any = (doc.data as any).createdAt;
+          const createdMs =
+            typeof createdAt?.toMillis === 'function' ? createdAt.toMillis() : typeof createdAt === 'number' ? createdAt : null;
+          const firstSeen = processingFirstSeen.current.get(doc.id) || Date.now();
+          const ageMs = createdMs ? Date.now() - createdMs : Date.now() - firstSeen;
+          // Non-PDF should never stay in processing; fail fast after 30s.
+          const maxAge = doc.data.type === 'pdf' ? 2 * 60 * 1000 : 30 * 1000;
+          if (ageMs > maxAge) {
+            await upsertUserDocument({
+              uid,
+              docId: doc.id,
+              data: {
+                type: doc.data.type,
+                title: doc.data.title,
+                pages: doc.data.pages || 1,
+                status: 'error',
+                storagePath: doc.data.storagePath,
+                processedPath: doc.data.processedPath,
+                errorMessage:
+                  doc.data.type === 'pdf'
+                    ? 'Upload was interrupted. Please re-upload the PDF.'
+                    : 'DOCX/TXT/RTF processing failed. Please re-upload the file.',
+              } as any,
+            });
+          }
+        } catch {
+          // ignore
         }
       }
-      setFileProgressMap(progressMap);
-    } catch (error) {
-      console.error('Error loading files:', error);
-    }
-  };
+    };
+    run();
+  }, [docs, uid]);
 
   const handleUploaded = async (file: UploadedFile) => {
     console.log('File uploaded callback received:', file);
-    // Wait a bit for metadata to be saved
-    await new Promise(resolve => setTimeout(resolve, 500));
-    // Refresh the file list from storage
-    await loadFiles();
     setRefreshKey(prev => prev + 1);
   };
 
-  if (selectedFile) {
-    // Validate selected file before rendering
-    if (!selectedFile.uri || !selectedFile.name) {
-      return (
-        <SafeAreaView style={styles.container}>
-          <View style={styles.viewerHeader}>
-            <TouchableOpacity onPress={() => setSelectedFile(null)}>
-              <Text style={styles.backText}>{'< Back'}</Text>
-            </TouchableOpacity>
-            <Text style={styles.viewerTitle}>Invalid File</Text>
-          </View>
-          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 }}>
-            <Text style={{ fontSize: 16, color: '#EF4444', textAlign: 'center' }}>
-              File information is invalid. Please try selecting the file again.
-            </Text>
-          </View>
-        </SafeAreaView>
-      );
-    }
-    
-    // Accept any file format for reading
-    const isReadableFile = true;
-    
-    if (readingMode && isReadableFile) {
-      return (
-        <ErrorBoundary>
-          <ReadingViewer
-            fileUri={selectedFile.uri}
-            filename={selectedFile.name}
-            onClose={() => {
-              setReadingMode(false);
-              setSelectedFile(null);
-              loadFiles(); // Refresh to update dashboard
-            }}
-            onComplete={(stats) => {
-              loadFiles(); // Refresh to update dashboard
-            }}
-          />
-        </ErrorBoundary>
-      );
-    }
-    
+  if (selectedDoc) {
     return (
-      <SafeAreaView style={styles.container}>
-        <View style={styles.viewerHeader}>
-          <View style={styles.viewerHeaderTop}>
-            <TouchableOpacity onPress={() => {
-              setReadingMode(false);
-              setSelectedFile(null);
-            }}>
-              <Text style={styles.backText}>{'< Back'}</Text>
-            </TouchableOpacity>
-            {isReadableFile && (
-              <TouchableOpacity
-                onPress={() => setReadingMode(true)}
-                style={styles.readButton}
-              >
-                <Text style={styles.readButtonText}>Read</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-          <Text style={styles.viewerTitle} numberOfLines={1}>
-            {selectedFile.name}
-          </Text>
-        </View>
-        <View style={{ flex: 1 }}>
-          <ErrorBoundary>
-            <FileViewer
-              fileUri={selectedFile.uri}
-              filename={selectedFile.name}
-              onClose={() => {
-                setReadingMode(false);
-                setSelectedFile(null);
-              }}
-            />
-          </ErrorBoundary>
-        </View>
-      </SafeAreaView>
+      <ErrorBoundary>
+        <ReadingViewer
+          fileUri={selectedDoc.data.processedPath}
+          filename={selectedDoc.data.title || selectedDoc.data.name}
+          docId={selectedDoc.id}
+          onClose={() => setSelectedDoc(null)}
+          onComplete={() => {
+            Alert.alert('Reading Complete', 'Great job! You can close this reader when you are ready.');
+          }}
+        />
+      </ErrorBoundary>
     );
   }
 
@@ -185,7 +208,7 @@ export default function HomeScreen() {
             </TouchableOpacity>
           </View>
           <Text style={[styles.title, isDark && styles.titleDark]}>
-            {userName ? `Hello ${userName}` : 'Your Files'}
+            {userDoc?.displayName ? `Hello ${userDoc.displayName}` : 'Your Documents'}
           </Text>
           <Text style={[styles.subtitle, isDark && styles.subtitleDark]}>Upload a file, then tap it below to read.</Text>
         </View>
@@ -195,89 +218,41 @@ export default function HomeScreen() {
         </View>
 
         <View style={styles.listSection}>
-          {files.length === 0 ? (
+          {docs.length === 0 ? (
             <View style={styles.emptyState}>
               <Text style={[styles.emptyTitle, isDark && styles.emptyTitleDark]}>No files yet</Text>
               <Text style={[styles.emptySubtitle, isDark && styles.emptySubtitleDark]}>Upload a file to see it listed here.</Text>
             </View>
           ) : (
             <FlatList
-              data={files}
+              data={docs}
               keyExtractor={(item) => item.id}
-              renderItem={({ item: file }) => {
-                const progress = fileProgressMap.get(file.name);
-                const hasProgress = progress?.hasProgress || false;
-                const progressPercentage = progress?.percentage || 0;
+              renderItem={({ item }) => {
                 
                 return (
                   <TouchableOpacity
                     style={[styles.fileItem, isDark && styles.fileItemDark]}
-                    onPress={async () => {
-                      try {
-                        console.log('[HomeScreen] File selected:', file.name, 'URI:', file.uri);
-                        
-                        // Validate file before setting
-                        if (!file || !file.uri || file.uri.trim() === '') {
-                          console.error('[HomeScreen] Invalid file or file URI');
-                          Alert.alert('Error', 'File information is invalid. Please try uploading the file again.');
-                          return;
-                        }
-                        
-                        if (!file.name || file.name.trim() === '') {
-                          console.error('[HomeScreen] Invalid file name');
-                          Alert.alert('Error', 'File name is invalid. Please try uploading the file again.');
-                          return;
-                        }
-                        
-                        // Verify file exists (non-blocking - just log warnings)
-                        // Don't block opening - let the file viewer handle errors
-                        try {
-                          const { FileSystem } = await import('expo-file-system');
-                          const fileInfo = await FileSystem.getInfoAsync(file.uri);
-                          
-                          if (!fileInfo || !fileInfo.exists) {
-                            console.warn('[HomeScreen] File does not exist at URI:', file.uri);
-                            // Don't block - let user try to open it anyway
-                            // The file viewer will show a proper error if it really doesn't work
-                          } else {
-                            console.log('[HomeScreen] File verified, exists');
-                          }
-                        } catch (verifyError: any) {
-                          // Verification failed, but continue anyway
-                          // File might still be accessible (e.g., DocumentPicker URIs)
-                          console.warn('[HomeScreen] Could not verify file, but continuing:', verifyError.message);
-                        }
-                        
-                        // Use setTimeout to prevent immediate crash if component fails to mount
-                        setTimeout(() => {
-                          try {
-                            setSelectedFile(file);
-                          } catch (setError: any) {
-                            console.error('[HomeScreen] Error setting selected file:', setError);
-                            Alert.alert('Error', 'Failed to open file. Please try again.');
-                          }
-                        }, 100);
-                      } catch (error: any) {
-                        console.error('[HomeScreen] Error selecting file:', error);
-                        console.error('[HomeScreen] Error stack:', error?.stack);
-                        Alert.alert('Error', `Failed to open file: ${error.message || 'Unknown error'}`);
+                    onPress={() => {
+                      if (item.data.status === 'processing') {
+                        Alert.alert('Processing', 'This document is still processing. Please try again in a moment.');
+                        return;
                       }
+                      if (item.data.status === 'error') {
+                        Alert.alert('Error', item.data.errorMessage || 'Processing failed. Please re-upload the file.');
+                        return;
+                      }
+                      setSelectedDoc(item);
                     }}
                   >
                     <View style={styles.fileItemContent}>
                       <View style={styles.fileItemLeft}>
                         <Text style={[styles.fileName, isDark && styles.fileNameDark]} numberOfLines={1}>
-                          {file.name}
+                          {item.data.title || item.data.name}
                         </Text>
                         <View style={styles.fileHintRow}>
-                          <Text style={[styles.fileHint, isDark && styles.fileHintDark]}>Tap to read • {file.type}</Text>
-                          {hasProgress && (
-                            <View style={styles.progressBadge}>
-                              <Text style={styles.progressBadgeText}>
-                                {progressPercentage < 100 ? `Resume (${progressPercentage}%)` : 'Completed'}
-                              </Text>
-                            </View>
-                          )}
+                          <Text style={[styles.fileHint, isDark && styles.fileHintDark]}>
+                            Tap to read • {item.data.type.toUpperCase()} • {item.data.status}
+                          </Text>
                         </View>
                       </View>
                     </View>

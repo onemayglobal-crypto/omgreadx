@@ -10,9 +10,11 @@ import {
   Alert,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { FileInfo, getAllFiles } from '@/utils/fileUtils';
-import { getReadingSessions, ReadingSession, getCompletedFiles, clearTodayReadingSessions, clearTodayCompletedFiles } from '@/utils/readingStorage';
 import { useTheme } from '@/contexts/ThemeContext';
+import { useAuth } from '@/contexts/AuthContext';
+import { listenDashboardSummary, type DashboardSummary } from '@/utils/firestoreDashboard';
+import { listenUserDocuments, type UserDocument } from '@/utils/firestoreDocuments';
+import { listenUserProgress } from '@/utils/firestoreProgress';
 
 interface DashboardStats {
   totalFiles: number;
@@ -32,8 +34,13 @@ interface ParentDashboardProps {
 
 export default function ParentDashboard({ refreshKey }: ParentDashboardProps) {
   const { theme, toggleTheme } = useTheme();
-  const [files, setFiles] = useState<FileInfo[]>([]);
-  const [sessions, setSessions] = useState<ReadingSession[]>([]);
+  const { uid } = useAuth();
+  const [summary, setSummary] = useState<DashboardSummary | null>(null);
+  const [docCount, setDocCount] = useState(0);
+  const [completedCount, setCompletedCount] = useState(0);
+  const [uploadedTodayCount, setUploadedTodayCount] = useState(0);
+  const [completedTodayCount, setCompletedTodayCount] = useState(0);
+  const [recentDocs, setRecentDocs] = useState<Array<{ id: string; data: UserDocument }>>([]);
   const [stats, setStats] = useState<DashboardStats>({
     totalFiles: 0,
     totalSessions: 0,
@@ -49,6 +56,22 @@ export default function ParentDashboard({ refreshKey }: ParentDashboardProps) {
   
   const isDark = theme === 'dark';
 
+  const isSameDay = (a: Date, b: Date) => {
+    const da = new Date(a);
+    const db = new Date(b);
+    da.setHours(0, 0, 0, 0);
+    db.setHours(0, 0, 0, 0);
+    return da.getTime() === db.getTime();
+  };
+
+  const toDate = (value: any): Date | null => {
+    if (!value) return null;
+    if (typeof value.toDate === 'function') return value.toDate();
+    if (typeof value.toMillis === 'function') return new Date(value.toMillis());
+    if (value instanceof Date) return value;
+    return null;
+  };
+
   const formatDuration = (totalSeconds: number) => {
     const s = Math.max(0, Math.floor(totalSeconds || 0));
     const m = Math.floor(s / 60);
@@ -57,145 +80,77 @@ export default function ParentDashboard({ refreshKey }: ParentDashboardProps) {
   };
 
   useEffect(() => {
-    loadDashboardData();
+    if (!uid) return;
+    setLoading(true);
+    const unsubSummary = listenDashboardSummary(uid, setSummary);
+    const unsubDocs = listenUserDocuments(uid, (docs) => {
+      setDocCount(docs.length);
+      setRecentDocs(docs.slice(0, 5));
+      const today = new Date();
+      const uploadedToday = docs.filter((d) => {
+        const created = toDate((d.data as any).createdAt);
+        return created ? isSameDay(created, today) : false;
+      }).length;
+      setUploadedTodayCount(uploadedToday);
+    });
+    const unsubProgress = listenUserProgress(uid, (items) => {
+      setCompletedCount(items.filter((p) => p.data.completed).length);
+      const today = new Date();
+      const completedToday = items.filter((p) => {
+        if (!p.data.completed) return false;
+        const lastRead = toDate((p.data as any).lastReadAt);
+        return lastRead ? isSameDay(lastRead, today) : false;
+      }).length;
+      setCompletedTodayCount(completedToday);
+    });
+    setLoading(false);
+    return () => {
+      unsubSummary();
+      unsubDocs();
+      unsubProgress();
+    };
   }, [refreshKey]);
 
+  useEffect(() => {
+    const avg = docCount > 0 ? Math.round((completedCount / docCount) * 100) : 0;
+    const todayProgress =
+      uploadedTodayCount > 0 ? Math.round((completedTodayCount / uploadedTodayCount) * 100) : 0;
+    setStats({
+      totalFiles: summary?.filesUploaded ?? docCount,
+      totalSessions: summary?.readingSessions ?? 0,
+      totalWordsRead: summary?.wordsRead ?? 0,
+      totalReadingTime: summary?.totalReadingTimeSec ?? 0,
+      averageCompletion: avg,
+      incompleteSessions: Math.max(0, docCount - completedCount),
+      todayProgress,
+      filesUploadedToday: uploadedTodayCount,
+      filesCompletedToday: completedTodayCount,
+    });
+  }, [summary, docCount, completedCount, uploadedTodayCount, completedTodayCount]);
+
   const handleResetToday = async () => {
-    Alert.alert(
-      'Reset Today\'s Data',
-      'Are you sure you want to reset today\'s reading sessions, words read, and reading time? This action cannot be undone.',
-      [
-        {
-          text: 'Cancel',
-          style: 'cancel',
-        },
-        {
-          text: 'Reset',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              setLoading(true);
-              // Clear today's reading sessions
-              await clearTodayReadingSessions();
-              // Clear today's completed files
-              await clearTodayCompletedFiles();
-              // Reload dashboard data
-              await loadDashboardData();
-              Alert.alert('Success', 'Today\'s reading data has been reset. New readings will be counted from now.');
-            } catch (error) {
-              console.error('Error resetting today\'s data:', error);
-              Alert.alert('Error', 'Failed to reset today\'s data. Please try again.');
-              setLoading(false);
-            }
-          },
-        },
-      ]
-    );
+    Alert.alert('Not available', 'Reset is not enabled for cloud sync yet.');
   };
 
   const loadDashboardData = async () => {
     try {
-      setLoading(true);
-      
-      console.log('Loading dashboard data...');
-      
-      // Load files
-      const fileList = await getAllFiles();
-      console.log('Files loaded:', fileList.length);
-      setFiles(fileList);
-      
-      // Load reading sessions from storage
-      const loadedSessions = await getReadingSessions();
-      console.log('Reading sessions loaded:', loadedSessions.length);
-      
-      // Load completed files
-      const completedFiles = await getCompletedFiles();
-      console.log('Completed files loaded:', completedFiles.length);
-      
-      // Calculate today's date range (start of today to end of today)
-      // This ensures data resets daily - only today's data is shown
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      
-      // Filter sessions to ONLY today's sessions (resets daily)
-      const todaySessions = loadedSessions.filter(session => {
-        const sessionDate = new Date(session.date);
-        sessionDate.setHours(0, 0, 0, 0); // Normalize to start of day for accurate comparison
-        return sessionDate.getTime() === today.getTime();
-      });
-      
-      // Dedupe today's sessions (older builds saved multiple cumulative entries per read)
-      const sessionMap = new Map<string, ReadingSession>();
-      for (const s of todaySessions) {
-        const key = `${s.filename}::${new Date(s.date).toDateString()}`;
-        const prev = sessionMap.get(key);
-        if (!prev) {
-          sessionMap.set(key, s);
-          continue;
-        }
-        sessionMap.set(key, {
-          ...s,
-          readingTime: Math.max(prev.readingTime ?? 0, s.readingTime ?? 0),
-          totalWords: Math.max(prev.totalWords ?? 0, s.totalWords ?? 0),
-          completionPercentage: Math.max(prev.completionPercentage ?? 0, s.completionPercentage ?? 0),
-          completedParagraphs: Math.max(prev.completedParagraphs ?? 0, s.completedParagraphs ?? 0),
-          totalParagraphs: Math.max(prev.totalParagraphs ?? 0, s.totalParagraphs ?? 0),
-        });
-      }
-      const dedupedTodaySessions = Array.from(sessionMap.values());
-      setSessions(dedupedTodaySessions);
-      
-      // Count files uploaded today (resets daily)
-      const filesUploadedToday = fileList.filter(file => {
-        const uploadDate = new Date(file.uploadDate);
-        uploadDate.setHours(0, 0, 0, 0);
-        return uploadDate.getTime() === today.getTime();
-      }).length;
-      
-      // Count files completed today (resets daily)
-      const filesCompletedToday = completedFiles.filter(file => {
-        const completedDate = new Date(file.completedDate);
-        completedDate.setHours(0, 0, 0, 0);
-        return completedDate.getTime() === today.getTime();
-      }).length;
-      
-      // Calculate today's progress percentage
-      const todayProgress = filesUploadedToday > 0
-        ? Math.round((filesCompletedToday / filesUploadedToday) * 100)
-        : 0;
-      
-      // Calculate today's stats - ONLY from today's sessions (resets daily)
-      // Only count words and reading time from sessions created today
-      const todayWordsRead = dedupedTodaySessions.reduce((sum, s) => sum + (s.totalWords || 0), 0);
-      const todayReadingTime = dedupedTodaySessions.reduce((sum, s) => sum + (s.readingTime || 0), 0);
-      
-      // Calculate average completion from today's sessions only
-      const avgCompletion = dedupedTodaySessions.length > 0
-        ? dedupedTodaySessions.reduce((sum, s) => sum + (s.completionPercentage || 0), 0) / dedupedTodaySessions.length
-        : 0;
-      const incompleteSessions = dedupedTodaySessions.filter(s => (s.completionPercentage || 0) < 100).length;
-      
-      const newStats = {
-        totalFiles: fileList.length,
-        totalSessions: dedupedTodaySessions.length, // Only today's sessions (deduped)
-        totalWordsRead: todayWordsRead, // Only today's words from today's sessions (resets daily)
-        totalReadingTime: todayReadingTime, // Only today's reading time from today's sessions (resets daily)
-        averageCompletion: Math.round(avgCompletion),
-        incompleteSessions,
+      // Realtime listener updates state; keep for pull-to-refresh compatibility.
+      const avg = docCount > 0 ? Math.round((completedCount / docCount) * 100) : 0;
+      const todayProgress =
+        uploadedTodayCount > 0 ? Math.round((completedTodayCount / uploadedTodayCount) * 100) : 0;
+      setStats({
+        totalFiles: summary?.filesUploaded ?? docCount,
+        totalSessions: summary?.readingSessions ?? 0,
+        totalWordsRead: summary?.wordsRead ?? 0,
+        totalReadingTime: summary?.totalReadingTimeSec ?? 0,
+        averageCompletion: avg,
+        incompleteSessions: Math.max(0, docCount - completedCount),
         todayProgress,
-        filesUploadedToday,
-        filesCompletedToday,
-      };
-      
-      console.log('Dashboard stats:', newStats);
-      setStats(newStats);
-      
-      setLoading(false);
+        filesUploadedToday: uploadedTodayCount,
+        filesCompletedToday: completedTodayCount,
+      });
     } catch (error) {
       console.error('Error loading dashboard:', error);
-      setLoading(false);
     }
   };
 
@@ -357,7 +312,7 @@ export default function ParentDashboard({ refreshKey }: ParentDashboardProps) {
       {/* Recent Files */}
       <View style={styles.section}>
         <Text style={[styles.sectionTitle, isDark && styles.sectionTitleDark]}>Uploaded Files</Text>
-        {files.length === 0 ? (
+        {recentDocs.length === 0 ? (
           <View style={[styles.emptyState, isDark && styles.emptyStateDark]}>
             <Ionicons name="document-outline" size={48} color={isDark ? "#6B7280" : "#9CA3AF"} />
             <Text style={[styles.emptyStateText, isDark && styles.emptyStateTextDark]}>No files uploaded yet</Text>
@@ -367,61 +322,49 @@ export default function ParentDashboard({ refreshKey }: ParentDashboardProps) {
           </View>
         ) : (
           <View style={[styles.fileList, isDark && styles.fileListDark]}>
-            {files.slice(0, 5).map((file) => (
-              <View key={file.id} style={[styles.fileItem, isDark && styles.fileItemDark]}>
+            {recentDocs.map((doc) => (
+              <View key={doc.id} style={[styles.fileItem, isDark && styles.fileItemDark]}>
                 <Ionicons name="document-text-outline" size={24} color={isDark ? "#9CA3AF" : "#6B7280"} />
                 <View style={styles.fileInfo}>
                   <Text style={[styles.fileName, isDark && styles.fileNameDark]} numberOfLines={1}>
-                    {file.name}
+                    {doc.data.title || doc.data.name}
                   </Text>
-                  <Text style={[styles.fileMeta, isDark && styles.fileMetaDark]}>{file.type} • {file.uploadDate.toLocaleDateString()}</Text>
+                  <Text style={[styles.fileMeta, isDark && styles.fileMetaDark]}>
+                    {doc.data.type.toUpperCase()} • {doc.data.status}
+                  </Text>
                 </View>
               </View>
             ))}
-            {files.length > 5 && (
-              <Text style={styles.moreFilesText}>
-                +{files.length - 5} more files
-              </Text>
-            )}
           </View>
         )}
       </View>
 
-      {/* Reading Sessions */}
+      {/* Reading Sessions (Cloud Summary) */}
       <View style={styles.section}>
-        <Text style={[styles.sectionTitle, isDark && styles.sectionTitleDark]}>Today's Reading Sessions</Text>
-        {sessions.length === 0 ? (
-          <View style={[styles.emptyState, isDark && styles.emptyStateDark]}>
-            <Ionicons name="book-outline" size={48} color={isDark ? "#6B7280" : "#9CA3AF"} />
-            <Text style={[styles.emptyStateText, isDark && styles.emptyStateTextDark]}>No reading sessions today</Text>
-            <Text style={[styles.emptyStateSubtext, isDark && styles.emptyStateSubtextDark]}>
-              Start reading files to track today's progress
-            </Text>
+        <Text style={[styles.sectionTitle, isDark && styles.sectionTitleDark]}>Reading Summary</Text>
+        <View style={[styles.fileList, isDark && styles.fileListDark]}>
+          <View style={[styles.fileItem, isDark && styles.fileItemDark]}>
+            <Ionicons name="time-outline" size={24} color={isDark ? "#9CA3AF" : "#6B7280"} />
+            <View style={styles.fileInfo}>
+              <Text style={[styles.fileName, isDark && styles.fileNameDark]}>Reading sessions</Text>
+              <Text style={[styles.fileMeta, isDark && styles.fileMetaDark]}>{stats.totalSessions}</Text>
+            </View>
           </View>
-        ) : (
-          <View style={[styles.fileList, isDark && styles.fileListDark]}>
-            {sessions.slice(0, 5).map((session) => (
-              <View key={session.id} style={[styles.fileItem, isDark && styles.fileItemDark]}>
-                <Ionicons 
-                  name={session.completionPercentage === 100 ? "checkmark-circle" : "time-outline"} 
-                  size={24} 
-                  color={session.completionPercentage === 100 ? "#10B981" : "#F59E0B"} 
-                />
-                <View style={styles.fileInfo}>
-                  <Text style={[styles.fileName, isDark && styles.fileNameDark]} numberOfLines={1}>
-                    {session.filename}
-                  </Text>
-                  <Text style={[styles.fileMeta, isDark && styles.fileMetaDark]}>
-                    {session.completedParagraphs}/{session.totalParagraphs} paragraphs • 
-                    {' '}{session.totalWords.toLocaleString()} words • 
-                    {' '}{Math.ceil(session.readingTime / 60)} Min • 
-                    {' '}{session.completionPercentage}% complete
-                  </Text>
-                </View>
-              </View>
-            ))}
+          <View style={[styles.fileItem, isDark && styles.fileItemDark]}>
+            <Ionicons name="text-outline" size={24} color={isDark ? "#9CA3AF" : "#6B7280"} />
+            <View style={styles.fileInfo}>
+              <Text style={[styles.fileName, isDark && styles.fileNameDark]}>Words read</Text>
+              <Text style={[styles.fileMeta, isDark && styles.fileMetaDark]}>{stats.totalWordsRead.toLocaleString()}</Text>
+            </View>
           </View>
-        )}
+          <View style={[styles.fileItem, isDark && styles.fileItemDark]}>
+            <Ionicons name="stopwatch-outline" size={24} color={isDark ? "#9CA3AF" : "#6B7280"} />
+            <View style={styles.fileInfo}>
+              <Text style={[styles.fileName, isDark && styles.fileNameDark]}>Reading time</Text>
+              <Text style={[styles.fileMeta, isDark && styles.fileMetaDark]}>{formatDuration(stats.totalReadingTime)}</Text>
+            </View>
+          </View>
+        </View>
       </View>
 
       {/* Key Features */}

@@ -9,9 +9,11 @@ import {
   RefreshControl,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { FileInfo, getAllFiles } from '@/utils/fileUtils';
-import { getReadingSessions, ReadingSession, getCompletedFiles } from '@/utils/readingStorage';
 import { useTheme } from '@/contexts/ThemeContext';
+import { useAuth } from '@/contexts/AuthContext';
+import { listenDashboardSummary, type DashboardSummary } from '@/utils/firestoreDashboard';
+import { listenUserDocuments } from '@/utils/firestoreDocuments';
+import { listenUserProgress } from '@/utils/firestoreProgress';
 
 interface DashboardStats {
   totalFiles: number;
@@ -27,8 +29,10 @@ interface PersonalDashboardProps {
 
 export default function PersonalDashboard({ refreshKey }: PersonalDashboardProps) {
   const { theme, toggleTheme } = useTheme();
-  const [files, setFiles] = useState<FileInfo[]>([]);
-  const [sessions, setSessions] = useState<ReadingSession[]>([]);
+  const { uid } = useAuth();
+  const [summary, setSummary] = useState<DashboardSummary | null>(null);
+  const [docCount, setDocCount] = useState(0);
+  const [completedCount, setCompletedCount] = useState(0);
   const [stats, setStats] = useState<DashboardStats>({
     totalFiles: 0,
     totalSessions: 0,
@@ -41,42 +45,31 @@ export default function PersonalDashboard({ refreshKey }: PersonalDashboardProps
   const isDark = theme === 'dark';
 
   useEffect(() => {
-    loadDashboardData();
+    if (!uid) return;
+    setLoading(true);
+    const unsubSummary = listenDashboardSummary(uid, setSummary);
+    const unsubDocs = listenUserDocuments(uid, (docs) => setDocCount(docs.length));
+    const unsubProgress = listenUserProgress(uid, (items) => {
+      setCompletedCount(items.filter((p) => p.data.completed).length);
+    });
+    setLoading(false);
+    return () => {
+      unsubSummary();
+      unsubDocs();
+      unsubProgress();
+    };
   }, [refreshKey]);
 
-  const isSameDay = (a: Date, b: Date) => {
-    const da = new Date(a);
-    const db = new Date(b);
-    da.setHours(0, 0, 0, 0);
-    db.setHours(0, 0, 0, 0);
-    return da.getTime() === db.getTime();
-  };
-
-  const dedupeDailySessions = (all: ReadingSession[], day: Date) => {
-    // Backward-compatible dedupe: older builds saved multiple cumulative entries per read.
-    // For each filename per day, keep the max readingTime/words/completion.
-    const map = new Map<string, ReadingSession>();
-    for (const s of all) {
-      if (!s?.date) continue;
-      if (!isSameDay(s.date, day)) continue;
-      const key = `${s.filename}::${new Date(s.date).toDateString()}`;
-      const prev = map.get(key);
-      if (!prev) {
-        map.set(key, s);
-        continue;
-      }
-      const better: ReadingSession = {
-        ...s,
-        readingTime: Math.max(prev.readingTime ?? 0, s.readingTime ?? 0),
-        totalWords: Math.max(prev.totalWords ?? 0, s.totalWords ?? 0),
-        completionPercentage: Math.max(prev.completionPercentage ?? 0, s.completionPercentage ?? 0),
-        completedParagraphs: Math.max(prev.completedParagraphs ?? 0, s.completedParagraphs ?? 0),
-        totalParagraphs: Math.max(prev.totalParagraphs ?? 0, s.totalParagraphs ?? 0),
-      };
-      map.set(key, better);
-    }
-    return Array.from(map.values());
-  };
+  useEffect(() => {
+    const avg = docCount > 0 ? Math.round((completedCount / docCount) * 100) : 0;
+    setStats({
+      totalFiles: summary?.filesUploaded ?? docCount,
+      totalSessions: summary?.readingSessions ?? 0,
+      totalWordsRead: summary?.wordsRead ?? 0,
+      totalReadingTime: summary?.totalReadingTimeSec ?? 0,
+      averageCompletion: avg,
+    });
+  }, [summary, docCount, completedCount]);
 
   const formatDuration = (totalSeconds: number) => {
     const s = Math.max(0, Math.floor(totalSeconds || 0));
@@ -87,40 +80,18 @@ export default function PersonalDashboard({ refreshKey }: PersonalDashboardProps
 
   const loadDashboardData = async () => {
     try {
-      setLoading(true);
-      
-      const fileList = await getAllFiles();
-      setFiles(fileList);
-      
-      const loadedSessions = await getReadingSessions();
-      const today = new Date();
-      const todaySessions = dedupeDailySessions(loadedSessions, today);
-      setSessions(todaySessions);
-      
-      const completedFiles = await getCompletedFiles();
-      
-      // Real-time / today totals (deduped to avoid inflated cumulative saves)
-      const filesUploadedToday = fileList.filter(f => isSameDay(f.uploadDate, today)).length;
-      const totalWordsRead = todaySessions.reduce((sum, s) => sum + (s.totalWords || 0), 0);
-      const totalReadingTime = todaySessions.reduce((sum, s) => sum + (s.readingTime || 0), 0);
-      
-      const avgCompletion = todaySessions.length > 0
-        ? todaySessions.reduce((sum, s) => sum + (s.completionPercentage || 0), 0) / todaySessions.length
-        : 0;
-      
-      const newStats = {
-        totalFiles: filesUploadedToday,
-        totalSessions: todaySessions.length,
-        totalWordsRead,
-        totalReadingTime,
-        averageCompletion: Math.round(avgCompletion),
-      };
-      
-      setStats(newStats);
-      setLoading(false);
+      // Realtime listeners already update state; keep for pull-to-refresh compatibility.
+      if (!uid) return;
+      const avg = docCount > 0 ? Math.round((completedCount / docCount) * 100) : 0;
+      setStats({
+        totalFiles: summary?.filesUploaded || docCount,
+        totalSessions: summary?.readingSessions || 0,
+        totalWordsRead: summary?.wordsRead || 0,
+        totalReadingTime: summary?.totalReadingTimeSec || 0,
+        averageCompletion: avg,
+      });
     } catch (error) {
       console.error('Error loading dashboard:', error);
-      setLoading(false);
     }
   };
 

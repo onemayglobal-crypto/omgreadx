@@ -18,9 +18,11 @@ import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import ReadingViewer from '@/components/reading-viewer';
 import { ErrorBoundary } from '@/components/error-boundary';
-import { saveTextAsFile } from '@/utils/textFileUtils';
 import { useTheme } from '@/contexts/ThemeContext';
-import { getAllTextDocuments, TextDocument } from '@/utils/textDocumentsStorage';
+import { auth } from '@/utils/firebaseConfig';
+import { bumpDashboardSummary } from '@/utils/firestoreDashboard';
+import { listenUserDocumentsByType, upsertUserDocument, type UserDocument } from '@/utils/firestoreDocuments';
+import { uploadJsonToStoragePath, uploadTextToStoragePath } from '@/utils/firebaseStorageHelpers';
 
 const dashboardBackground = require('@/assets/images/dashboard.png');
 
@@ -33,21 +35,20 @@ export default function TextInputScreen() {
   const [isLoading, setIsLoading] = useState(false);
   const [savedFileUri, setSavedFileUri] = useState<string | null>(null);
   const [savedFileName, setSavedFileName] = useState<string>('');
-  const [documents, setDocuments] = useState<TextDocument[]>([]);
+  const [cloudDocId, setCloudDocId] = useState<string | null>(null);
+  const [documents, setDocuments] = useState<Array<{ id: string; data: UserDocument }>>([]);
   
   const isDark = theme === 'dark';
 
   const loadDocuments = async () => {
-    try {
-      const docs = await getAllTextDocuments();
-      setDocuments(docs);
-    } catch (error) {
-      console.error('[TextInput] Error loading text documents:', error);
-    }
+    // no-op; realtime listener handles updates
   };
 
   React.useEffect(() => {
-    loadDocuments();
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+    const unsub = listenUserDocumentsByType(uid, 'paste', setDocuments);
+    return () => unsub();
   }, []);
 
   const handlePaste = async () => {
@@ -87,29 +88,53 @@ export default function TextInputScreen() {
     setIsLoading(true);
 
     try {
+      if (!auth.currentUser?.uid) {
+        setIsLoading(false);
+        Alert.alert('Sign in required', 'Please sign in to save and read pasted text.');
+        return;
+      }
+
       // Generate a title if not provided
       const fileTitle = title.trim() || `Text Document ${new Date().toLocaleDateString()}`;
       
-      console.log('[TextInput] Saving text as file:', fileTitle);
-      console.log('[TextInput] Text content preview:', text.substring(0, 100));
-      
-      // Save the text as a file
-      const result = await saveTextAsFile(text, fileTitle);
-      console.log('[TextInput] saveTextAsFile returned:', result);
-      
-      const { uri, filename } = result;
-      console.log('[TextInput] File saved successfully:', { uri, filename });
-      
-      // Verify we got valid values
-      if (!uri || !filename) {
-        throw new Error('File save returned invalid URI or filename');
-      }
+      const uid = auth.currentUser.uid;
+      const email = auth.currentUser.email || '';
+      const name = auth.currentUser.displayName || email || 'User';
+      const docId = `${Date.now()}`;
+
+      // Storage paths (strict)
+      const originalPath = `users/${uid}/files/${docId}/original.txt`;
+      const pastePath = `users/${uid}/paste/${docId}.json`;
+
+      // 1) Upload original as .txt (keeps schema consistent)
+      await uploadTextToStoragePath({ storagePath: originalPath, text, extension: 'txt', contentType: 'text/plain' });
+
+      // 2) Upload paste JSON payload
+      await uploadJsonToStoragePath({ storagePath: pastePath, json: { pages: 1, text } });
+
+      // 3) Firestore document metadata
+      await upsertUserDocument({
+        uid,
+        docId,
+        data: {
+          type: 'paste',
+          title: fileTitle,
+          pages: 1,
+          status: 'ready',
+          storagePath: originalPath,
+          processedPath: pastePath,
+        },
+      });
+
+      // 4) Dashboard count
+      await bumpDashboardSummary({ uid, name, email, filesUploadedDelta: 1 });
       
       console.log('[TextInput] Setting state to show ReadingViewer...');
       
       // Set state to show ReadingViewer
-      setSavedFileUri(uri);
-      setSavedFileName(filename);
+      setSavedFileUri(pastePath);
+      setSavedFileName(fileTitle);
+      setCloudDocId(docId);
       setIsReading(true);
       setIsLoading(false);
 
@@ -162,11 +187,13 @@ export default function TextInputScreen() {
         <ReadingViewer
           fileUri={savedFileUri}
           filename={savedFileName}
+          docId={cloudDocId || undefined}
           onClose={() => {
             console.log('[TextInput] ReadingViewer onClose called');
             setIsReading(false);
             setSavedFileUri(null);
             setSavedFileName('');
+            setCloudDocId(null);
             // Show success message
             Alert.alert(
               'Text Saved',
@@ -349,9 +376,10 @@ Long press to paste from clipboard`}
                   key={doc.id}
                   style={[styles.savedDocItem, isDark && styles.savedDocItemDark]}
                   onPress={() => {
-                    console.log('[TextInput] Opening saved document:', doc.title);
-                    setSavedFileUri(doc.uri);
-                    setSavedFileName(`${doc.title || 'Text Document'}.txt`);
+                    console.log('[TextInput] Opening saved document:', doc.data.title);
+                    setSavedFileUri(doc.data.processedPath);
+                    setSavedFileName(doc.data.title || 'Text Document');
+                    setCloudDocId(doc.id);
                     setIsReading(true);
                   }}
                 >
@@ -360,14 +388,13 @@ Long press to paste from clipboard`}
                       style={[styles.savedDocTitle, isDark && styles.savedDocTitleDark]}
                       numberOfLines={1}
                     >
-                      {doc.title || 'Untitled document'}
+                      {doc.data.title || 'Untitled document'}
                     </Text>
                     <Text
                       style={[styles.savedDocMeta, isDark && styles.savedDocMetaDark]}
                       numberOfLines={1}
                     >
-                      {doc.wordCount.toLocaleString()} words •{' '}
-                      {new Date(doc.createdAt).toLocaleString()}
+                      {doc.data.pages} page • {doc.data.status}
                     </Text>
                   </View>
                   <Ionicons

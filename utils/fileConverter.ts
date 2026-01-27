@@ -1,6 +1,10 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import { Platform } from 'react-native';
 import { getFileExtension } from './fileUtils';
+import { getFirebaseIdToken } from '@/utils/firebaseAuth';
+import { auth, storage } from '@/utils/firebaseConfig';
+import { getDownloadURL, ref as storageRef } from 'firebase/storage';
+import { base64ToUint8Array, base64ToUtf8String, uint8ArrayToBase64 } from '@/utils/base64';
 
 export type FileType = 'pdf' | 'docx' | 'txt' | 'image' | 'unsupported';
 
@@ -11,7 +15,8 @@ export function detectFileType(filename: string): FileType {
   const ext = getFileExtension(filename);
   
   if (ext === 'pdf') return 'pdf';
-  if (ext === 'docx' || ext === 'doc') return 'docx';
+  if (ext === 'doc') return 'unsupported';
+  if (ext === 'docx') return 'docx';
   if (['txt', 'md', 'json', 'xml', 'html', 'htm', 'csv'].includes(ext)) return 'txt';
   if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) return 'image';
   
@@ -46,6 +51,9 @@ export async function convertFileToText(fileUri: string, filename: string): Prom
     }
     
     default:
+      if (type === 'unsupported') {
+        throw new Error('DOC files are not supported. Please save as DOCX and try again.');
+      }
       // For any unknown file type, try to read as plain text
       console.log(`[FileConverter] Unknown file type "${type}", attempting to read as text...`);
       return await extractTextFromTXT(fileUri);
@@ -57,7 +65,7 @@ export async function convertFileToText(fileUri: string, filename: string): Prom
  * Falls back to local extraction if backend is unavailable
  */
 async function extractTextFromPDF(fileUri: string): Promise<string> {
-  const BACKEND_URL = 'https://readx-backend-360873415676.asia-south1.run.app';
+  const BACKEND_URL = 'https://readx-backend-740104261370.asia-south1.run.app';
   
   try {
     console.log('[FileConverter] Attempting PDF extraction using backend API...');
@@ -89,20 +97,15 @@ async function extractTextFromPDF(fileUri: string): Promise<string> {
           const response = await fetch(fileUri);
           const blob = await response.blob();
           const arrayBuffer = await blob.arrayBuffer();
-          const binaryString = String.fromCharCode(...new Uint8Array(arrayBuffer));
-          pdfBase64 = btoa(binaryString);
+          pdfBase64 = uint8ArrayToBase64(new Uint8Array(arrayBuffer));
         } catch (fetchError: any) {
           throw new Error(`Failed to read PDF file: ${fetchError.message || 'Unknown error'}`);
         }
       }
       
       // Create Blob from base64
-      const binaryString = atob(pdfBase64);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      const blob = new Blob([bytes], { type: 'application/pdf' });
+      const bytes = base64ToUint8Array(pdfBase64);
+      const blob = new Blob([bytes.buffer as any], { type: 'application/pdf' });
       formData.append('file', blob, 'document.pdf');
     } else {
       // React Native: Use file URI directly if it's a file path, otherwise convert from base64
@@ -151,9 +154,13 @@ async function extractTextFromPDF(fileUri: string): Promise<string> {
     const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout
     
     try {
+      const idToken = await getFirebaseIdToken();
       const response = await fetch(`${BACKEND_URL}/extract/pdf`, {
         method: 'POST',
         body: formData,
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+        },
         signal: controller.signal,
       });
       
@@ -180,31 +187,40 @@ async function extractTextFromPDF(fileUri: string): Promise<string> {
         // Include status code in error message for better error handling
         throw new Error(`Backend API error: ${response.status} - ${errorDetails}`);
       }
-      
-      // Parse JSON response (backend returns { source, pages, text })
-      let extractedText: string;
-      const contentType = response.headers.get('content-type') || '';
-      
-      if (contentType.includes('application/json')) {
-        const result = await response.json();
-        // Backend returns { source: "text-pdf" | "ocr-pdf", pages: number, text: string }
-        extractedText = result.text || result.data || result.content || (typeof result === 'string' ? result : JSON.stringify(result));
-      } else {
-        // Fallback: assume plain text response
-        extractedText = await response.text();
+
+      // Backend returns metadata: { fileId, pages, method }
+      const result = await response.json().catch(async () => {
+        const raw = await response.text();
+        throw new Error(`Backend returned invalid response. ${raw ? `Response: ${raw}` : ''}`.trim());
+      });
+
+      const fileId: string | undefined = result?.fileId;
+      if (!fileId) {
+        throw new Error('Backend returned invalid response. Missing fileId.');
       }
-      
-      if (typeof extractedText !== 'string') {
-        throw new Error('Backend returned invalid response format');
+
+      const uid = auth.currentUser?.uid;
+      if (!uid) {
+        throw new Error('Please sign in to continue.');
       }
-      
+
+      // Download processed JSON from Firebase Storage (written by backend)
+      const processedPath = `users/${uid}/processed/${fileId}.json`;
+      const url = await getDownloadURL(storageRef(storage, processedPath));
+      const processedResp = await fetch(url);
+      if (!processedResp.ok) {
+        throw new Error('Failed to download processed content. Please try again.');
+      }
+
+      const processedJson = await processedResp.json().catch(() => null);
+      const extractedText = typeof processedJson?.text === 'string' ? processedJson.text : '';
       const text = extractedText.trim();
-      
-      if (!text || text.length === 0) {
-        throw new Error('Backend returned empty text. PDF may be scanned or unreadable.');
+
+      if (!text) {
+        throw new Error('No text detected in this PDF. Please upload a text-based PDF (not images).');
       }
-      
-      console.log(`[FileConverter] Successfully extracted ${text.length} characters from PDF using backend API`);
+
+      console.log(`[FileConverter] Successfully extracted ${text.length} characters from PDF via backend+Storage`);
       return text;
     } catch (fetchError: any) {
       clearTimeout(timeoutId);
@@ -269,38 +285,23 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
             fileUri.startsWith('data:application/msword;base64,')) {
           console.log('[FileConverter] Detected base64 data URI for DOCX');
           const base64Data = fileUri.split(',')[1];
-          const binaryString = atob(base64Data);
-          const bytes = new Uint8Array(binaryString.length);
-          for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-          }
-          return bytes.buffer;
+          return base64ToUint8Array(base64Data).buffer;
         } else if (fileUri.startsWith('data:')) {
           // Generic data URI - try to extract base64
           console.log('[FileConverter] Detected generic data URI for DOCX, attempting to extract base64');
           const base64Match = fileUri.match(/data:[^;]*;base64,(.+)/);
           if (base64Match) {
             const base64Data = base64Match[1];
-            const binaryString = atob(base64Data);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
-            }
-            return bytes.buffer;
+            return base64ToUint8Array(base64Data).buffer;
           } else {
             throw new Error('Invalid data URI format for DOCX');
           }
         } else if (Platform.OS === 'ios' || Platform.OS === 'android') {
-          // Mobile: Use FileSystem directly (more reliable)
+          // Mobile: prefer FileSystem base64 (stable for local file:// URIs)
           const fileBase64 = await FileSystem.readAsStringAsync(fileUri, {
             encoding: 'base64',
           } as any);
-          const binaryString = atob(fileBase64);
-          const bytes = new Uint8Array(binaryString.length);
-          for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-          }
-          return bytes.buffer;
+          return base64ToUint8Array(fileBase64).buffer;
         } else {
           // Web: Try fetch first
           try {
@@ -311,12 +312,7 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
             const fileBase64 = await FileSystem.readAsStringAsync(fileUri, {
               encoding: 'base64',
             } as any);
-            const binaryString = atob(fileBase64);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-              bytes[i] = binaryString.charCodeAt(i);
-            }
-            return bytes.buffer;
+            return base64ToUint8Array(fileBase64).buffer;
           }
         }
       })();
@@ -325,14 +321,35 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
         setTimeout(() => reject(new Error(`DOCX file load timeout after ${timeoutDuration / 1000} seconds`)), timeoutDuration)
       );
       
-      arrayBuffer = await Promise.race([loadPromise, timeoutPromise]);
+      arrayBuffer = (await Promise.race([loadPromise, timeoutPromise])) as ArrayBuffer;
     } catch (loadError: any) {
       throw new Error(`Failed to load DOCX file: ${loadError.message || 'Unknown error'}. Please ensure the file is accessible.`);
     }
     
-    // Extract text using mammoth with timeout
-    // Use convertToHtml for better formatting preservation, fallback to extractRawText
+    // Try ZIP XML extraction first (more stable on mobile)
     let extractedText = '';
+    try {
+      const JSZip = (await import('jszip')).default;
+      const zip = await JSZip.loadAsync(arrayBuffer);
+      const docXml = await zip.file('word/document.xml')?.async('string');
+      if (docXml) {
+        extractedText = docXml
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+    } catch (zipError) {
+      console.warn('[FileConverter] DOCX zip extraction failed:', zipError);
+    }
+
+    // On native, avoid mammoth if we already got text
+    if (Platform.OS !== 'web' && extractedText.trim().length > 0) {
+      console.log(`[FileConverter] Extracted ${extractedText.length} characters from DOCX (zip)`);
+      return extractedText;
+    }
+
+    // Extract text using mammoth with timeout (web or fallback)
+    // Use convertToHtml for better formatting preservation, fallback to extractRawText
     
     try {
       // Try convertToHtml first (preserves formatting better)
@@ -392,7 +409,7 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
     }
     
     if (!extractedText || extractedText.trim().length === 0) {
-      throw new Error('No text content found in DOCX file');
+      throw new Error('No text content found in DOCX file. Please save as DOCX (not DOC) and try again.');
     }
     
     console.log(`[FileConverter] Successfully extracted ${extractedText.length} characters from DOCX`);
@@ -439,7 +456,7 @@ async function extractTextFromTXT(fileUri: string): Promise<string> {
         const base64Match = fileUri.match(/data:text\/plain[^,]*base64,(.+)/);
         if (base64Match) {
           // Base64 encoded
-          const text = atob(base64Match[1]);
+          const text = base64ToUtf8String(base64Match[1]);
           console.log(`[FileConverter] Extracted ${text.length} characters from base64 data URI`);
           return text;
         } else {
@@ -471,7 +488,15 @@ async function extractTextFromTXT(fileUri: string): Promise<string> {
     
     // Add timeout for file reading (longer timeout on mobile)
     const timeoutDuration = Platform.OS === 'web' ? 30000 : 60000;
-    const readPromise = FileSystem.readAsStringAsync(fileUri);
+    const readPromise = (async () => {
+      if (Platform.OS === 'web') {
+        const resp = await fetch(fileUri);
+        if (resp.ok) {
+          return await resp.text();
+        }
+      }
+      return await FileSystem.readAsStringAsync(fileUri);
+    })();
     const timeoutPromise = new Promise<never>((_, reject) => 
       setTimeout(() => reject(new Error(`File read timeout after ${timeoutDuration / 1000} seconds`)), timeoutDuration)
     );
@@ -496,11 +521,11 @@ async function extractTextFromTXT(fileUri: string): Promise<string> {
  */
 async function extractTextFromImage(fileUri: string): Promise<string> {
   try {
-    console.log('[FileConverter] Extracting text from image using OCR...');
+    console.log('[FileConverter] Extracting text from image');
     
     // Check platform compatibility
     if (Platform.OS !== 'web') {
-      console.warn('[FileConverter] OCR on mobile may be slow or unavailable');
+      console.warn('[FileConverter] file conversion on mobile may be slow or unavailable');
     }
     
     const tesseract = await import('tesseract.js');

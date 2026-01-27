@@ -4,36 +4,24 @@ import { useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import ParentDashboard from '@/components/parent-dashboard';
 import PersonalDashboard from '@/components/personal-dashboard';
-import { getUserProfile } from '@/utils/profileStorage';
+import { useAuth } from '@/contexts/AuthContext';
 
 const dashboardBackground = require('@/assets/images/dashboard.png');
 
 export default function ExploreScreen() {
   const [refreshKey, setRefreshKey] = useState(0);
-  const [profileType, setProfileType] = useState<'personal' | 'child' | null>(null);
   const [loading, setLoading] = useState(true);
+  const { userDoc, authLoading } = useAuth();
 
-  // Load profile type
   useEffect(() => {
-    loadProfileType();
-  }, []);
-
-  const loadProfileType = async () => {
-    try {
-      const profile = await getUserProfile();
-      setProfileType(profile?.profileType || null);
-    } catch (error) {
-      console.error('Error loading profile type:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+    if (authLoading) return;
+    setLoading(false);
+  }, [authLoading]);
 
   // Refresh when screen comes into focus
   useFocusEffect(
     React.useCallback(() => {
       setRefreshKey(prev => prev + 1);
-      loadProfileType();
     }, [])
   );
 
@@ -66,7 +54,7 @@ export default function ExploreScreen() {
   return (
     <ImageBackground source={dashboardBackground} style={styles.backgroundImage} resizeMode="cover">
       <SafeAreaView style={styles.container}>
-        {profileType === 'child' ? (
+        {userDoc?.role === 'parent' ? (
           <ParentDashboard refreshKey={refreshKey} />
         ) : (
           <PersonalDashboard refreshKey={refreshKey} />

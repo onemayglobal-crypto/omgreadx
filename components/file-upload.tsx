@@ -1,15 +1,22 @@
 import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, ActivityIndicator, Alert, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, ActivityIndicator, Alert, StyleSheet, Platform } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import { Ionicons } from '@expo/vector-icons';
-import { saveFile, isReadableFormat, formatFileSize, getFileType, getFileExtension } from '@/utils/fileUtils';
+import { getFileExtension } from '@/utils/fileUtils';
+import { auth } from '@/utils/firebaseConfig';
+import { getFirebaseIdToken } from '@/utils/firebaseAuth';
+import { uploadJsonToStoragePath, uploadLocalFileToStorage } from '@/utils/firebaseStorageHelpers';
+import { bumpDashboardSummary } from '@/utils/firestoreDashboard';
+import { upsertUserDocument, type DocumentType } from '@/utils/firestoreDocuments';
+import { downloadJsonFromStoragePath } from '@/utils/firebaseStorageHelpers';
+import * as FileSystem from 'expo-file-system/legacy';
 
 /**
  * Check if file format is supported
  */
 const isSupportedFormat = (filename: string): boolean => {
   const ext = getFileExtension(filename).toLowerCase();
-  const supportedFormats = ['pdf', 'doc', 'docx', 'txt', 'rtf'];
+  const supportedFormats = ['pdf', 'docx', 'txt', 'rtf'];
   return supportedFormats.includes(ext);
 };
 
@@ -25,8 +32,110 @@ interface FileUploadProps {
 export default function FileUpload({ onFileUploaded }: FileUploadProps) {
   const [uploading, setUploading] = useState(false);
 
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  const buildPdfFormData = async (params: { uri: string; name: string }) => {
+    // Ensures the URI is uploadable by fetch/multipart on Android (content:// can be flaky).
+    let uploadUri = params.uri;
+    let tempFileUri: string | null = null;
+
+    if (Platform.OS !== 'web' && !uploadUri.startsWith('file://')) {
+      const base64 = await FileSystem.readAsStringAsync(uploadUri, { encoding: 'base64' } as any);
+      tempFileUri = `${FileSystem.cacheDirectory || FileSystem.documentDirectory}readx-upload-${Date.now()}.pdf`;
+      await FileSystem.writeAsStringAsync(tempFileUri, base64, { encoding: 'base64' } as any);
+      uploadUri = tempFileUri;
+    }
+
+    const formData = new FormData();
+    if (Platform.OS === 'web') {
+      const blob = await (await fetch(params.uri)).blob();
+      (formData as any).append('file', blob, params.name);
+    } else {
+      formData.append('file', {
+        uri: uploadUri,
+        name: params.name,
+        type: 'application/pdf',
+      } as any);
+    }
+
+    return {
+      formData,
+      cleanup: async () => {
+        if (tempFileUri) {
+          try {
+            await FileSystem.deleteAsync(tempFileUri, { idempotent: true } as any);
+          } catch {
+            // ignore
+          }
+        }
+      },
+    };
+  };
+
+  const waitForProcessedJson = async (processedPath: string): Promise<{ pages?: number; text?: string } | null> => {
+    // Poll Storage for up to ~60s (backend processing time).
+    const maxAttempts = 10;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const json = await downloadJsonFromStoragePath(processedPath);
+        return json;
+      } catch {
+        // backoff: 0.5s, 1s, 2s, 4s... capped
+        const delay = Math.min(8000, 500 * Math.pow(2, attempt));
+        await sleep(delay);
+      }
+    }
+    return null;
+  };
+
+  const normalizePickedFileUri = async (params: { uri: string; extension: string }) => {
+    if (Platform.OS === 'web') {
+      return { uri: params.uri, cleanup: async () => {} };
+    }
+    if (params.uri.startsWith('file://')) {
+      return { uri: params.uri, cleanup: async () => {} };
+    }
+    // Copy content:// (or other) into cache so both conversion + Storage upload are stable.
+    const tmp = `${FileSystem.cacheDirectory || FileSystem.documentDirectory}readx-picked-${Date.now()}.${params.extension}`;
+    await FileSystem.copyAsync({ from: params.uri, to: tmp });
+    return {
+      uri: tmp,
+      cleanup: async () => {
+        try {
+          await FileSystem.deleteAsync(tmp, { idempotent: true } as any);
+        } catch {
+          // ignore
+        }
+      },
+    };
+  };
+
+  const requireSignedIn = () => {
+    if (!auth.currentUser?.uid) {
+      Alert.alert('Sign in required', 'Please sign in to upload files.');
+      return false;
+    }
+    return true;
+  };
+
+  const toDocType = (ext: string): DocumentType => {
+    if (ext === 'pdf') return 'pdf';
+    if (ext === 'doc' || ext === 'docx') return 'docx';
+    return 'txt';
+  };
+
+  const contentTypeFromExt = (ext: string): string => {
+    if (ext === 'pdf') return 'application/pdf';
+    if (ext === 'docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    if (ext === 'doc') return 'application/msword';
+    if (ext === 'txt') return 'text/plain';
+    if (ext === 'rtf') return 'application/rtf';
+    return 'application/octet-stream';
+  };
+
   const pickDocument = async () => {
     try {
+      if (!requireSignedIn()) return;
       setUploading(true);
       console.log('[FileUpload] Opening document picker...');
       
@@ -54,73 +163,190 @@ export default function FileUpload({ onFileUploaded }: FileUploadProps) {
         const ext = getFileExtension(file.name).toUpperCase() || 'Unknown';
         Alert.alert(
           'Unsupported File Format',
-          `The file format "${ext}" is not supported.\n\nSupported formats: PDF, DOC, DOCX, TXT, RTF only.`,
+          `The file format "${ext}" is not supported.\n\nSupported formats: PDF, DOCX, TXT, RTF only.`,
           [{ text: 'OK' }]
         );
         setUploading(false);
         return;
       }
 
-      let finalUri = file.uri;
-      let uploadSuccess = false;
-      
-      try {
-        console.log('[FileUpload] Saving file to storage...');
-        finalUri = await saveFile(file.uri, file.name);
-        console.log('[FileUpload] File saved successfully, final URI:', finalUri);
-        uploadSuccess = true;
-      } catch (saveError: any) {
-        console.error('[FileUpload] Error in saveFile:', saveError);
-        console.error('[FileUpload] Error details:', {
-          message: saveError?.message,
-          stack: saveError?.stack,
-        });
-        
-        // Always try to save metadata, even if file copy failed
-        // This ensures the file appears in the list
+      const uid = auth.currentUser!.uid;
+      const email = auth.currentUser?.email || '';
+      const name = auth.currentUser?.displayName || email || 'User';
+
+      const ext = getFileExtension(file.name).toLowerCase();
+      const type = toDocType(ext);
+      const title = file.name;
+      const contentType = contentTypeFromExt(ext);
+
+      // For PDFs, backend generates docId (fileId). For others, we use a timestamp docId.
+      let docId = `${Date.now()}`;
+
+      if (ext === 'pdf') {
+        // 1) Call secured backend with Firebase ID token (backend writes processed JSON to Storage)
+        const idToken = await getFirebaseIdToken();
+        const { formData, cleanup } = await buildPdfFormData({ uri: file.uri, name: file.name });
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60000);
+
+        let resp: Response;
         try {
-          console.log('[FileUpload] Attempting to save metadata as fallback...');
-          const { addFileToList } = await import('@/utils/fileStorage');
-          const { getFileType } = await import('@/utils/fileUtils');
-          const fileInfo = {
-            id: `${Date.now()}-${file.name}`,
-            name: file.name,
-            uri: file.uri, // Use original URI
-            type: getFileType(file.name),
-            size: file.size || 0,
-            uploadDate: new Date(),
-          };
-          await addFileToList(fileInfo);
-          console.log('[FileUpload] Metadata saved successfully');
-          uploadSuccess = true;
-          finalUri = file.uri;
-        } catch (metadataError: any) {
-          console.error('[FileUpload] Failed to save metadata:', metadataError);
-          // Still continue - file might work with original URI
-          finalUri = file.uri;
-          console.warn('[FileUpload] Using original URI, metadata save failed');
+          resp = await fetch(`https://readx-backend-740104261370.asia-south1.run.app/extract/pdf`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${idToken}` },
+            body: formData,
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timeoutId);
+          await cleanup();
+        }
+
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => '');
+          throw new Error(txt ? 'PDF extraction failed. Please try another PDF.' : 'PDF extraction failed.');
+        }
+
+        const json = await resp.json();
+        docId = String(json.fileId || docId);
+      }
+
+      const storagePath = `users/${uid}/files/${docId}/original.${ext}`;
+      const processedPath = `users/${uid}/processed/${docId}.json`;
+
+      // 2) Create Firestore metadata early only for PDF (processing → ready/error)
+      if (ext === 'pdf') {
+        await upsertUserDocument({
+          uid,
+          docId,
+          data: {
+            type,
+            title,
+            pages: 1,
+            status: 'processing',
+            storagePath,
+            processedPath,
+          },
+        });
+      }
+
+      let normalized: { uri: string; cleanup: () => Promise<void> } | null = null;
+      try {
+        // Normalize URI once so conversion + Storage upload don't break on Android content:// URIs.
+        normalized =
+          ext === 'pdf'
+            ? { uri: file.uri, cleanup: async () => {} }
+            : await normalizePickedFileUri({ uri: file.uri, extension: ext });
+
+        // 3) Upload original file to Storage (required schema)
+        await uploadLocalFileToStorage({ storagePath, fileUri: normalized.uri, contentType });
+
+        // 4) For non-PDF types, create processed JSON ourselves (no large text in Firestore)
+        if (ext !== 'pdf') {
+          const { convertFileToText } = await import('@/utils/fileConverter');
+          const conversionTimeout = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('File conversion timeout. Please try again.')), 30000)
+          );
+          const text = await Promise.race([convertFileToText(normalized.uri, file.name), conversionTimeout]);
+          const pages = 1;
+          await uploadJsonToStoragePath({ storagePath: processedPath, json: { pages, text } });
+
+          await upsertUserDocument({
+            uid,
+            docId,
+            data: {
+              type,
+              title,
+              pages,
+              status: 'ready',
+              storagePath,
+              processedPath,
+            },
+          });
+        } else {
+          // Wait for backend processed JSON (realtime UI shows "processing" while we wait)
+          const processed = await waitForProcessedJson(processedPath);
+          if (!processed || typeof processed?.text !== 'string' || !processed.text.trim()) {
+            await upsertUserDocument({
+              uid,
+              docId,
+              data: {
+                type,
+                title,
+                pages: typeof processed?.pages === 'number' ? processed.pages : 1,
+                status: 'error',
+                storagePath,
+                processedPath,
+                errorMessage: 'PDF processing failed. Please upload a text-based PDF (not images).',
+              } as any,
+            });
+            throw new Error('PDF processing failed. Please upload a correct PDF format without images.');
+          }
+
+          await upsertUserDocument({
+            uid,
+            docId,
+            data: {
+              type,
+              title,
+              pages: typeof processed?.pages === 'number' ? processed.pages : 1,
+              status: 'ready',
+              storagePath,
+              processedPath,
+            },
+          });
+        }
+
+      } catch (e: any) {
+        // Ensure documents never get stuck in "processing"
+        const msg =
+          typeof e?.message === 'string' && e.message.trim()
+            ? e.message
+            : 'Processing failed. Please try again.';
+        await upsertUserDocument({
+          uid,
+          docId,
+          data: {
+            type,
+            title,
+            pages: 1,
+            status: 'error',
+            storagePath,
+            processedPath,
+            errorMessage:
+              ext === 'pdf'
+                ? 'PDF processing failed. Please upload a correct PDF format without images.'
+                : 'File processing failed. Please upload only PDF, DOCX, TXT, RTF files.',
+          } as any,
+        });
+        throw new Error(msg);
+      } finally {
+        try {
+          await normalized?.cleanup();
+        } catch {
+          // ignore
         }
       }
+
+      // 5) Update dashboard summary counters (strict path)
+      await bumpDashboardSummary({
+        uid,
+        name,
+        email,
+        filesUploadedDelta: 1,
+      });
 
       // Notify parent component about the uploaded file
       if (onFileUploaded) {
         console.log('[FileUpload] Calling onFileUploaded callback');
-        onFileUploaded({ uri: finalUri, name: file.name });
+        onFileUploaded({ uri: processedPath, name: file.name });
       }
 
-      if (uploadSuccess) {
-        Alert.alert('Success', `File "${file.name}" uploaded successfully!`);
-      } else {
-        Alert.alert(
-          'Partial Success', 
-          `File "${file.name}" is ready to read, but may not persist after app restart.`
-        );
-      }
+      Alert.alert('Success', `File "${file.name}" uploaded successfully!`);
       
       setUploading(false);
     } catch (error: any) {
-      console.error('[FileUpload] Error in document picker:', error);
-      console.error('[FileUpload] Error stack:', error?.stack);
       const message =
         typeof error?.message === 'string'
           ? error.message
@@ -150,7 +376,7 @@ export default function FileUpload({ onFileUploaded }: FileUploadProps) {
           </>
         )}
       </TouchableOpacity>
-      <Text style={styles.hint}>Supported formats: PDF, DOC, DOCX, TXT, RTF only</Text>
+      <Text style={styles.hint}>Supported formats: PDF, DOCX, TXT, RTF only</Text>
     </View>
   );
 }

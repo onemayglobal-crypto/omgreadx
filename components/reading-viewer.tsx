@@ -1,3 +1,4 @@
+// Legacy local-only tracking (kept as fallback for older flows)
 import { saveReadingSession, getFileReadingProgress, saveReadingProgress, markFileAsCompleted } from '@/utils/readingStorage';
 import { Ionicons } from '@expo/vector-icons';
 import React, { useEffect, useRef, useState, useCallback } from 'react';
@@ -18,10 +19,15 @@ import { TextLineMapper, LineBounds } from '@/utils/textLineMapper';
 import { ReadingProgressTracker, ReadingProgress } from '@/utils/readingProgressTracker';
 import EyeTrackingCamera from '@/components/eyeTrackingCamera';
 import EyeTrackingServiceComponent from '@/components/EyeTrackingServiceComponent';
+import { auth } from '@/utils/firebaseConfig';
+import { downloadJsonFromStoragePath } from '@/utils/firebaseStorageHelpers';
+import { getProgress, upsertProgress } from '@/utils/firestoreProgress';
+import { bumpDashboardSummary } from '@/utils/firestoreDashboard';
 
 interface ReadingViewerProps {
   fileUri: string;
   filename: string;
+  docId?: string;
   onClose?: () => void;
   onComplete?: (stats: ReadingStats) => void;
 }
@@ -61,7 +67,7 @@ interface LineReadingState {
 
 type TextSize = 'small' | 'medium' | 'large';
 
-export default function ReadingViewer({ fileUri, filename, onClose, onComplete }: ReadingViewerProps) {
+export default function ReadingViewer({ fileUri, filename, docId, onClose, onComplete }: ReadingViewerProps) {
   const { theme, toggleTheme } = useTheme();
   const [paragraphs, setParagraphs] = useState<Paragraph[]>([]);
   const [currentParagraphIndex, setCurrentParagraphIndex] = useState(0);
@@ -90,6 +96,8 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
   const progressTrackers = useRef<Map<number, ReadingProgressTracker>>(new Map());
   
   const isDark = theme === 'dark';
+  const isCloudDoc = Boolean(docId && auth.currentUser?.uid);
+  const isStorageJsonPath = fileUri.startsWith('users/') && fileUri.endsWith('.json');
 
   useEffect(() => {
     loadAndParseFile();
@@ -303,14 +311,30 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
             .map((p, idx) => p.isCompleted ? idx : -1)
             .filter(idx => idx >= 0);
           
-          await saveReadingProgress({
-            filename: filename,
-            fileUri: fileUri,
-            currentParagraphIndex: currentParagraphIndex,
-            completedParagraphs: completedIndices,
-            lastUpdated: new Date(),
-            totalParagraphs: paragraphs.length,
-          });
+          // Cloud sync: `/users/{uid}/progress/{docId}` (preferred)
+          if (isCloudDoc && docId) {
+            const uid = auth.currentUser.uid;
+            const email = auth.currentUser.email || '';
+            const name = auth.currentUser.displayName || email || 'User';
+            await upsertProgress({
+              uid,
+              docId,
+              name,
+              email,
+              currentPage: currentParagraphIndex,
+              completed: completedIndices.length >= paragraphs.length && paragraphs.length > 0,
+            });
+          } else {
+            // Legacy local-only fallback
+            await saveReadingProgress({
+              filename: filename,
+              fileUri: fileUri,
+              currentParagraphIndex: currentParagraphIndex,
+              completedParagraphs: completedIndices,
+              lastUpdated: new Date(),
+              totalParagraphs: paragraphs.length,
+            });
+          }
         } catch (error) {
           console.error('Error saving reading progress:', error);
         }
@@ -330,6 +354,9 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
   // Save reading session when a paragraph is completed or periodically (every 60 seconds)
   const lastSessionSaveTime = useRef<number>(0);
   const lastCompletedCount = useRef<number>(0);
+  const lastSummaryWords = useRef<number>(0);
+  const lastSummaryTime = useRef<number>(0);
+  const summarySessionBumped = useRef<boolean>(false);
   
   const saveSessionIfNeeded = useCallback(async () => {
     try {
@@ -348,26 +375,68 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
       const shouldSavePeriodically = timeSinceLastSave >= 60 && (completedParagraphs > 0 || readingTime >= 60);
       
       if (hasNewCompletion || shouldSavePeriodically) {
-        await saveReadingSession({
-          id: sessionIdRef.current,
-          filename: filename,
-          totalParagraphs: paragraphs.length,
-          completedParagraphs: completedParagraphs,
-          totalWords: wordsRead,
-          readingTime: readingTime,
-          completionPercentage: paragraphs.length > 0
-            ? Math.round((completedParagraphs / paragraphs.length) * 100)
-            : 0,
-          date: new Date(),
-        });
+        if (!isCloudDoc) {
+          await saveReadingSession({
+            id: sessionIdRef.current,
+            filename: filename,
+            totalParagraphs: paragraphs.length,
+            completedParagraphs: completedParagraphs,
+            totalWords: wordsRead,
+            readingTime: readingTime,
+            completionPercentage: paragraphs.length > 0
+              ? Math.round((completedParagraphs / paragraphs.length) * 100)
+              : 0,
+            date: new Date(),
+          });
+        }
         lastSessionSaveTime.current = currentTime;
         lastCompletedCount.current = completedParagraphs;
         console.log('Reading session saved');
+
+        // Cloud sync: bump dashboard summary deltas (once per session, then deltas thereafter)
+        if (docId && auth.currentUser?.uid) {
+          const uid = auth.currentUser.uid;
+          const email = auth.currentUser.email || '';
+          const name = auth.currentUser.displayName || email || 'User';
+
+          const deltaWords = Math.max(0, wordsRead - lastSummaryWords.current);
+          const deltaTime = Math.max(0, readingTime - lastSummaryTime.current);
+          const sessionDelta = summarySessionBumped.current ? 0 : 1;
+
+          await bumpDashboardSummary({
+            uid,
+            name,
+            email,
+            readingSessionsDelta: sessionDelta,
+            wordsReadDelta: deltaWords,
+            totalReadingTimeSecDelta: deltaTime,
+          });
+
+          summarySessionBumped.current = true;
+          lastSummaryWords.current = wordsRead;
+          lastSummaryTime.current = readingTime;
+        }
       }
     } catch (error) {
       console.error('Error saving reading session:', error);
     }
   }, [paragraphs, filename, startTime]);
+
+  const markCloudCompleted = useCallback(async () => {
+    if (!isCloudDoc || !docId || !auth.currentUser?.uid) return;
+    const uid = auth.currentUser.uid;
+    const email = auth.currentUser.email || '';
+    const name = auth.currentUser.displayName || email || 'User';
+    const lastIndex = Math.max(0, paragraphs.length - 1);
+    await upsertProgress({
+      uid,
+      docId,
+      name,
+      email,
+      currentPage: Math.max(currentParagraphIndex, lastIndex),
+      completed: true,
+    });
+  }, [currentParagraphIndex, docId, isCloudDoc, paragraphs.length]);
 
   // Save session periodically
   useEffect(() => {
@@ -477,9 +546,17 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
         throw new Error('Invalid file URI');
       }
 
-      // Verify file exists (non-blocking - just log warnings)
-      // Don't block loading - try to load anyway and show error if it fails
-      if (!fileUri.startsWith('asyncstorage://') && !fileUri.startsWith('data:')) {
+      // Verify file exists (non-blocking) for real file URIs only.
+      // Skip for Firebase Storage paths like `users/{uid}/processed/{docId}.json`.
+      const isLikelyLocalUri =
+        fileUri.startsWith('file:') ||
+        fileUri.startsWith('content:') ||
+        fileUri.startsWith('http') ||
+        fileUri.startsWith('https') ||
+        fileUri.startsWith('asyncstorage://') ||
+        fileUri.startsWith('data:');
+
+      if (isLikelyLocalUri && !fileUri.startsWith('asyncstorage://') && !fileUri.startsWith('data:')) {
         try {
           const FileSystem = await import('expo-file-system/legacy');
           const fileInfo = await FileSystem.getInfoAsync(fileUri);
@@ -497,72 +574,75 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
         }
       }
 
-      // Load previous reading progress
-      let savedProgress = null;
-      try {
-        savedProgress = await getFileReadingProgress(filename, fileUri);
-        if (savedProgress) {
-          console.log('[ReadingViewer] Found saved progress:', savedProgress);
+      // Load previous reading progress:
+      // - If docId is provided, use Firestore `/users/{uid}/progress/{docId}` (cloud sync)
+      // - Otherwise fall back to legacy local storage
+      let savedProgress: any = null;
+      if (docId && auth.currentUser?.uid) {
+        try {
+          const p = await getProgress(auth.currentUser.uid, docId);
+          if (p) {
+            savedProgress = {
+              currentParagraphIndex: Math.max(0, p.currentPage || 0),
+              // We don't store per-paragraph completion in Firestore schema.
+              // We'll assume paragraphs before currentPage were completed.
+              completedParagraphs: [],
+              totalParagraphs: 0,
+            };
+          }
+        } catch {
+          // ignore; start fresh
         }
-      } catch (progressError) {
-        console.warn('[ReadingViewer] Could not load saved progress:', progressError);
+      } else {
+        try {
+          savedProgress = await getFileReadingProgress(filename, fileUri);
+          if (savedProgress) {
+            console.log('[ReadingViewer] Found saved progress:', savedProgress);
+          }
+        } catch (progressError) {
+          console.warn('[ReadingViewer] Could not load saved progress:', progressError);
+        }
       }
 
-      // Validate file format before attempting conversion
-      const { getFileExtension } = await import('@/utils/fileUtils');
-      const fileExt = getFileExtension(filename).toLowerCase();
-      const supportedFormats = ['pdf', 'doc', 'docx', 'txt', 'rtf'];
-      
-      if (!supportedFormats.includes(fileExt)) {
-        const ext = fileExt.toUpperCase() || 'Unknown';
-        setError(`Unsupported file format: "${ext}".\n\nSupported formats: PDF, DOC, DOCX, TXT, RTF only.\n\nPlease upload a file in one of these formats.`);
-        setLoading(false);
-        return;
+      // Validate file format only for legacy local flow.
+      if (!isStorageJsonPath) {
+        const { getFileExtension } = await import('@/utils/fileUtils');
+        const fileExt = getFileExtension(filename).toLowerCase();
+        const supportedFormats = ['pdf', 'doc', 'docx', 'txt', 'rtf'];
+
+        if (!supportedFormats.includes(fileExt)) {
+          const ext = fileExt.toUpperCase() || 'Unknown';
+          setError(
+            `Unsupported file format: "${ext}".\n\nSupported formats: PDF, DOC, DOCX, TXT, RTF only.\n\nPlease upload a file in one of these formats.`
+          );
+          setLoading(false);
+          return;
+        }
       }
 
-      // Use the centralized file converter utility
-      const { convertFileToText, detectFileType } = await import('@/utils/fileConverter');
-      
-      const fileType = detectFileType(filename);
-      console.log(`[ReadingViewer] Detected file type: ${fileType}`);
-      
-      // Convert file to text using the utility with timeout
+      // Load text content:
+      // - If fileUri is a Firebase Storage processed path (`users/{uid}/processed/{docId}.json`), load it.
+      // - Else, fall back to local conversion.
       let textContent: string;
-      try {
-        // Add overall timeout for file conversion (important for mobile)
+      if (isStorageJsonPath) {
+        const processed = await downloadJsonFromStoragePath(fileUri);
+        textContent = typeof processed?.text === 'string' ? processed.text : '';
+        if (!textContent.trim()) {
+          throw new Error('No text detected in this PDF. Please upload a text-based PDF (not images).');
+        }
+      } else {
+        const { convertFileToText, detectFileType } = await import('@/utils/fileConverter');
+        const fileType = detectFileType(filename);
+        console.log(`[ReadingViewer] Detected file type: ${fileType}`);
+
         const conversionPromise = convertFileToText(fileUri, filename);
-        const timeoutPromise = new Promise<never>((_, reject) => 
+        const timeoutPromise = new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error('File conversion timeout - the file may be too large or corrupted')), 60000)
         );
-        
         textContent = await Promise.race([conversionPromise, timeoutPromise]);
-        
         if (!textContent || textContent.trim().length === 0) {
           throw new Error('No text content extracted from file. The file may be empty or contain only images.');
         }
-      } catch (conversionError: any) {
-        console.error('[ReadingViewer] File conversion error:', conversionError);
-        const errorMessage = conversionError?.message || 'Failed to extract text from file';
-        
-        // Check if it's a backend API error with 500 status (PDF extraction failed)
-        if (errorMessage.includes('Backend API error: 500') || 
-            (errorMessage.includes('Backend API error') && errorMessage.includes('PDF extraction failed'))) {
-          // Show user-friendly format error message
-          setError('This file format is not supported. Upload a correct PDF format without images.');
-        } else if (errorMessage.includes('Backend API request timeout') ||
-                   errorMessage.includes('Cannot connect to backend server') ||
-                   (errorMessage.includes('Backend PDF extraction failed') && !errorMessage.includes('500'))) {
-          // Show backend connection error for timeouts and connection issues
-          setError(`Backend connection failed.\n\n${errorMessage}\n\nPlease ensure:\n• The backend server is running at https://readx-backend-360873415676.asia-south1.run.app\n• Your device has internet connectivity\n• The backend service is accessible`);
-        } else if (errorMessage.includes('Unsupported file format') || errorMessage.includes('format is not supported')) {
-          // Format validation error (already handled)
-          setError(errorMessage);
-        } else {
-          // Other file reading errors
-          setError(`File reading error: ${errorMessage}. Please ensure the file is not corrupted and try again.`);
-        }
-        setLoading(false);
-        return;
       }
 
       // Parse text into paragraphs
@@ -575,16 +655,13 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
         }
         
         // Restore saved progress if available
-        if (savedProgress && savedProgress.totalParagraphs === parsedParagraphs.length) {
+        if (savedProgress) {
           console.log('[ReadingViewer] Restoring saved progress...');
-          // Mark completed paragraphs
-          savedProgress.completedParagraphs.forEach((idx: number) => {
-            if (idx >= 0 && idx < parsedParagraphs.length) {
-              parsedParagraphs[idx].isCompleted = true;
-            }
-          });
-          // Set current paragraph index
-          const resumeIndex = Math.min(savedProgress.currentParagraphIndex, parsedParagraphs.length - 1);
+          const resumeIndex = Math.min(savedProgress.currentParagraphIndex || 0, parsedParagraphs.length - 1);
+          // Mark completed paragraphs up to resumeIndex (cloud schema doesn't store per-paragraph)
+          for (let i = 0; i < resumeIndex; i++) {
+            parsedParagraphs[i].isCompleted = true;
+          }
           setCurrentParagraphIndex(resumeIndex);
           console.log(`[ReadingViewer] Resuming from paragraph ${resumeIndex + 1}`);
         }
@@ -906,6 +983,13 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
         console.error('Error saving reading session:', error);
       }
       
+      // Mark completion in cloud
+      try {
+        await markCloudCompleted();
+      } catch {
+        // ignore
+      }
+
       if (onComplete) {
         onComplete(finalStats);
       }
@@ -993,17 +1077,17 @@ export default function ReadingViewer({ fileUri, filename, onClose, onComplete }
         readingTime: finalStats.readingTime,
       });
 
+      // Mark completion in cloud
+      try {
+        await markCloudCompleted();
+      } catch {
+        // ignore
+      }
+
       // Call onComplete callback
       if (onComplete) {
         onComplete(finalStats);
       }
-      
-      // Close the viewer after a short delay to ensure save completes
-      setTimeout(() => {
-        if (onClose) {
-          onClose();
-        }
-      }, 300);
     } catch (error) {
       console.error('Error marking file as fully completed:', error);
     }

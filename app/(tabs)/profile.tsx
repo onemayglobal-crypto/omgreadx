@@ -4,7 +4,6 @@ import {
   Text,
   StyleSheet,
   TouchableOpacity,
-  TextInput,
   Image,
   ScrollView,
   Alert,
@@ -14,98 +13,52 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '@/contexts/ThemeContext';
-import { getUserProfile, saveUserProfile, pickImage, UserProfile, ProfileType } from '@/utils/profileStorage';
+import { useAuth } from '@/contexts/AuthContext';
+import { setUserRole, type UserRole } from '@/utils/firestoreUsers';
 
 const dashboardBackground = require('@/assets/images/dashboard.png');
 
 export default function ProfileScreen() {
   const { theme, toggleTheme } = useTheme();
-  const [profile, setProfile] = useState<UserProfile | null>(null);
-  const [displayName, setDisplayName] = useState('');
-  const [avatarUri, setAvatarUri] = useState<string | undefined>(undefined);
-  const [profileType, setProfileType] = useState<ProfileType | undefined>(undefined);
-  const [isEditing, setIsEditing] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
+  const { firebaseUser, uid, userDoc, authLoading, signOut } = useAuth();
+  const [profileType, setProfileType] = useState<'personal' | 'child' | undefined>(undefined);
+  const [savingRole, setSavingRole] = useState(false);
   
   const isDark = theme === 'dark';
 
   useEffect(() => {
-    loadProfile();
-  }, []);
+    if (!userDoc?.role) return;
+    // Backward-compat: older builds stored "child" for personal mode.
+    const role = (userDoc.role as any) === 'child' ? 'personal' : userDoc.role;
+    setProfileType(role === 'parent' ? 'child' : 'personal');
+  }, [userDoc?.role]);
 
-  const loadProfile = async () => {
+  const handleSelectProfileType = async (type: 'personal' | 'child') => {
+    if (!uid) return;
+    const role: UserRole = type === 'child' ? 'parent' : 'personal';
+    setProfileType(type);
     try {
-      setIsLoading(true);
-      const savedProfile = await getUserProfile();
-      if (savedProfile) {
-        setProfile(savedProfile);
-        setDisplayName(savedProfile.displayName);
-        setAvatarUri(savedProfile.avatarUri);
-        setProfileType(savedProfile.profileType);
-        setIsEditing(false);
-      } else {
-        setIsEditing(true); // If no profile exists, show edit mode
+      setSavingRole(true);
+      await setUserRole(uid, role);
+      if (type === 'child') {
+        Alert.alert(
+          'Parent Dashboard',
+          "You can monitor the dashboard for your child's reading progress."
+        );
       }
-    } catch (error) {
-      console.error('Error loading profile:', error);
-      Alert.alert('Error', 'Failed to load profile');
+    } catch {
+      Alert.alert('Error', 'Failed to update profile type. Please try again.');
     } finally {
-      setIsLoading(false);
+      setSavingRole(false);
     }
   };
 
-  const handleSave = async () => {
-    if (!displayName.trim()) {
-      Alert.alert('Error', 'Please enter a display name');
-      return;
-    }
-
-    try {
-      setIsSaving(true);
-      const now = new Date();
-      if (!profileType) {
-        Alert.alert('Error', 'Please select whether this is Personal or For Child');
-        return;
-      }
-
-      const updatedProfile: UserProfile = {
-        displayName: displayName.trim(),
-        avatarUri: avatarUri,
-        profileType: profileType,
-        createdAt: profile?.createdAt || now,
-        updatedAt: now,
-      };
-      
-      await saveUserProfile(updatedProfile);
-      setProfile(updatedProfile);
-      setIsEditing(false);
-      Alert.alert('Success', 'Profile updated successfully');
-    } catch (error) {
-      console.error('Error saving profile:', error);
-      Alert.alert('Error', 'Failed to save profile');
-    } finally {
-      setIsSaving(false);
-    }
+  const handleSignOut = async () => {
+    await signOut();
+    Alert.alert('Signed out', 'You have been signed out.');
   };
 
-  const handlePickImage = async () => {
-    try {
-      const uri = await pickImage();
-      if (uri) {
-        setAvatarUri(uri);
-      }
-    } catch (error) {
-      console.error('Error picking image:', error);
-      Alert.alert('Error', 'Failed to pick image');
-    }
-  };
-
-  const handleRemoveImage = () => {
-    setAvatarUri(undefined);
-  };
-
-  if (isLoading) {
+  if (authLoading) {
     return (
       <ImageBackground source={dashboardBackground} style={styles.backgroundImage} resizeMode="cover">
         <SafeAreaView style={[styles.container, isDark && styles.containerDark]}>
@@ -142,167 +95,87 @@ export default function ProfileScreen() {
 
         {/* Profile Content */}
         <View style={styles.profileContent}>
-          {/* Avatar Section */}
-          <View style={styles.avatarSection}>
-            <TouchableOpacity
-              activeOpacity={0.8}
-              onPress={isEditing ? handlePickImage : undefined}
-              disabled={!isEditing}
-            >
-              <View style={[styles.avatarContainer, isDark && styles.avatarContainerDark, !isEditing && styles.avatarContainerNonEditable]}>
-                {avatarUri ? (
-                  <Image source={{ uri: avatarUri }} style={styles.avatar} />
-                ) : (
-                  <View style={[styles.avatarPlaceholder, isDark && styles.avatarPlaceholderDark]}>
-                    <Ionicons name="person" size={64} color={isDark ? '#9CA3AF' : '#6B7280'} />
-                  </View>
-                )}
-                {isEditing && (
-                  <View style={[styles.avatarEditOverlay, isDark && styles.avatarEditOverlayDark]}>
-                    <Ionicons name="camera" size={24} color="#ffffff" />
-                  </View>
-                )}
+          {/* Signed-in view: show only photo + name */}
+          {firebaseUser && (
+            <>
+              <View style={styles.avatarSection}>
+                <View style={[styles.avatarContainer, isDark && styles.avatarContainerDark]}>
+                  {(userDoc?.photoURL || firebaseUser.photoURL) ? (
+                    <Image
+                      source={{ uri: (userDoc?.photoURL || firebaseUser.photoURL) as string }}
+                      style={styles.avatar}
+                    />
+                  ) : (
+                    <View style={[styles.avatarPlaceholder, isDark && styles.avatarPlaceholderDark]}>
+                      <Ionicons name="person" size={64} color={isDark ? '#9CA3AF' : '#6B7280'} />
+                    </View>
+                  )}
+                </View>
               </View>
-            </TouchableOpacity>
-            {isEditing && avatarUri && (
-              <TouchableOpacity
-                style={[styles.removeImageButton, isDark && styles.removeImageButtonDark]}
-                onPress={handleRemoveImage}
-              >
-                <Ionicons name="trash-outline" size={16} color={isDark ? '#EF4444' : '#DC2626'} />
-                <Text style={[styles.removeImageText, isDark && styles.removeImageTextDark]}>Remove Photo</Text>
-              </TouchableOpacity>
-            )}
-          </View>
 
-          {/* Display Name Section */}
-          <View style={styles.nameSection}>
-            <Text style={[styles.label, isDark && styles.labelDark]}>Display Name / Username</Text>
-            {isEditing ? (
-              <TextInput
-                style={[styles.nameInput, isDark && styles.nameInputDark]}
-                value={displayName}
-                onChangeText={setDisplayName}
-                placeholder="Enter your name"
-                placeholderTextColor={isDark ? '#6B7280' : '#9CA3AF'}
-                autoFocus={!profile}
-              />
-            ) : (
-              <View style={[styles.nameDisplay, isDark && styles.nameDisplayDark]}>
-                <Text style={[styles.nameText, isDark && styles.nameTextDark]}>
-                  {displayName || 'No name set'}
-                </Text>
+              <View style={styles.nameSection}>
+                <Text style={[styles.label, isDark && styles.labelDark]}>Name</Text>
+                <View style={[styles.nameDisplay, isDark && styles.nameDisplayDark]}>
+                  <Text style={[styles.nameText, isDark && styles.nameTextDark]}>
+                    {userDoc?.displayName || firebaseUser.displayName || firebaseUser.email || 'User'}
+                  </Text>
+                </View>
               </View>
-            )}
-          </View>
+            </>
+          )}
 
           {/* Profile Type Section */}
-          <View style={styles.profileTypeSection}>
-            <Text style={[styles.label, isDark && styles.labelDark]}>Profile Type</Text>
-            <Text style={[styles.subLabel, isDark && styles.subLabelDark]}>
-              Is this account for personal use or to monitor a child's reading?
-            </Text>
-            {isEditing ? (
-              <View style={styles.profileTypeOptions}>
+          {firebaseUser && (
+            <View style={styles.profileTypeSection}>
+              <Text style={[styles.label, isDark && styles.labelDark]}>Choose</Text>
+              <View style={[styles.typeToggle, isDark && styles.typeToggleDark]}>
                 <TouchableOpacity
                   style={[
-                    styles.profileTypeOption,
-                    profileType === 'personal' && styles.profileTypeOptionSelected,
-                    isDark && styles.profileTypeOptionDark,
-                    profileType === 'personal' && isDark && styles.profileTypeOptionSelectedDark,
+                    styles.typeToggleBtn,
+                    profileType === 'personal' && styles.typeToggleBtnActive,
                   ]}
-                  onPress={() => setProfileType('personal')}
+                  onPress={() => handleSelectProfileType('personal')}
+                  disabled={savingRole}
                 >
-                  <Ionicons 
-                    name="person" 
-                    size={24} 
-                    color={profileType === 'personal' ? '#ffffff' : (isDark ? '#9CA3AF' : '#6B7280')} 
-                  />
-                  <Text style={[
-                    styles.profileTypeOptionText,
-                    profileType === 'personal' && styles.profileTypeOptionTextSelected,
-                    isDark && styles.profileTypeOptionTextDark,
-                    profileType === 'personal' && isDark && styles.profileTypeOptionTextSelectedDark,
-                  ]}>
+                  <Text
+                    style={[
+                      styles.typeToggleText,
+                      profileType === 'personal' && styles.typeToggleTextActive,
+                    ]}
+                  >
                     Personal
                   </Text>
                 </TouchableOpacity>
+
                 <TouchableOpacity
                   style={[
-                    styles.profileTypeOption,
-                    profileType === 'child' && styles.profileTypeOptionSelected,
-                    isDark && styles.profileTypeOptionDark,
-                    profileType === 'child' && isDark && styles.profileTypeOptionSelectedDark,
+                    styles.typeToggleBtn,
+                    profileType === 'child' && styles.typeToggleBtnActive,
                   ]}
-                  onPress={() => setProfileType('child')}
+                  onPress={() => handleSelectProfileType('child')}
+                  disabled={savingRole}
                 >
-                  <Ionicons 
-                    name="people" 
-                    size={24} 
-                    color={profileType === 'child' ? '#ffffff' : (isDark ? '#9CA3AF' : '#6B7280')} 
-                  />
-                  <Text style={[
-                    styles.profileTypeOptionText,
-                    profileType === 'child' && styles.profileTypeOptionTextSelected,
-                    isDark && styles.profileTypeOptionTextDark,
-                    profileType === 'child' && isDark && styles.profileTypeOptionTextSelectedDark,
-                  ]}>
+                  <Text
+                    style={[
+                      styles.typeToggleText,
+                      profileType === 'child' && styles.typeToggleTextActive,
+                    ]}
+                  >
                     For Child
                   </Text>
                 </TouchableOpacity>
               </View>
-            ) : (
-              <View style={[styles.profileTypeDisplay, isDark && styles.profileTypeDisplayDark]}>
-                <Ionicons 
-                  name={profileType === 'child' ? 'people' : 'person'} 
-                  size={20} 
-                  color={isDark ? '#60A5FA' : '#2563EB'} 
-                />
-                <Text style={[styles.profileTypeDisplayText, isDark && styles.profileTypeDisplayTextDark]}>
-                  {profileType === 'child' ? 'For Child (Parent Dashboard)' : 'Personal (Dashboard)'}
-                </Text>
-              </View>
-            )}
-          </View>
+            </View>
+          )}
 
           {/* Action Buttons */}
-          {isEditing ? (
-            <View style={styles.buttonContainer}>
-              <TouchableOpacity
-                style={[styles.saveButton, isDark && styles.saveButtonDark]}
-                onPress={handleSave}
-                disabled={isSaving}
-              >
-                {isSaving ? (
-                  <ActivityIndicator color="#ffffff" />
-                ) : (
-                  <>
-                    <Ionicons name="checkmark" size={20} color="#ffffff" />
-                    <Text style={styles.saveButtonText}>Save</Text>
-                  </>
-                )}
-              </TouchableOpacity>
-              {profile && (
-                <TouchableOpacity
-                  style={[styles.cancelButton, isDark && styles.cancelButtonDark]}
-                  onPress={() => {
-                    setDisplayName(profile.displayName);
-                    setAvatarUri(profile.avatarUri);
-                    setProfileType(profile.profileType);
-                    setIsEditing(false);
-                  }}
-                >
-                  <Text style={[styles.cancelButtonText, isDark && styles.cancelButtonTextDark]}>Cancel</Text>
-                </TouchableOpacity>
-              )}
-            </View>
-          ) : (
+          {firebaseUser && (
             <TouchableOpacity
-              style={[styles.editButton, isDark && styles.editButtonDark]}
-              onPress={() => setIsEditing(true)}
+              style={[styles.signOutButton, isDark && styles.signOutButtonDark]}
+              onPress={handleSignOut}
             >
-              <Ionicons name="pencil" size={20} color={isDark ? '#60A5FA' : '#2563EB'} />
-              <Text style={[styles.editButtonText, isDark && styles.editButtonTextDark]}>Edit Profile</Text>
+              <Ionicons name="log-out-outline" size={18} color={isDark ? '#FCA5A5' : '#DC2626'} />
+              <Text style={[styles.signOutText, isDark && styles.signOutTextDark]}>Sign Out</Text>
             </TouchableOpacity>
           )}
         </View>
@@ -370,6 +243,50 @@ const styles = StyleSheet.create({
   },
   profileContent: {
     padding: 24,
+  },
+  authCard: {
+    backgroundColor: 'rgba(255, 255, 255, 0.92)',
+    borderRadius: 16,
+    padding: 20,
+    alignItems: 'center',
+    marginBottom: 24,
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.08)',
+  },
+  authCardDark: {
+    backgroundColor: 'rgba(31, 41, 55, 0.92)',
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  authTitle: {
+    marginTop: 8,
+    fontSize: 22,
+    fontWeight: '900',
+    color: '#0F172A',
+  },
+  authTitleDark: {
+    color: '#FFFFFF',
+  },
+  authSubtitle: {
+    marginTop: 6,
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#374151',
+    textAlign: 'center',
+  },
+  authSubtitleDark: {
+    color: '#E5E7EB',
+  },
+  authButton: {
+    marginTop: 14,
+    backgroundColor: '#6366F1',
+    paddingVertical: 12,
+    paddingHorizontal: 18,
+    borderRadius: 14,
+  },
+  authButtonText: {
+    color: '#111827',
+    fontWeight: '900',
+    fontSize: 16,
   },
   avatarSection: {
     alignItems: 'center',
@@ -441,6 +358,36 @@ const styles = StyleSheet.create({
   },
   profileTypeSection: {
     marginBottom: 32,
+  },
+  typeToggle: {
+    flexDirection: 'row',
+    backgroundColor: 'rgba(17, 24, 39, 0.08)',
+    borderRadius: 12,
+    padding: 4,
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.08)',
+  },
+  typeToggleDark: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255,255,255,0.12)',
+  },
+  typeToggleBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  typeToggleBtnActive: {
+    backgroundColor: '#6366F1',
+  },
+  typeToggleText: {
+    fontSize: 15,
+    fontWeight: '900',
+    color: '#6B7280',
+  },
+  typeToggleTextActive: {
+    color: '#111827',
   },
   subLabel: {
     fontSize: 14,
@@ -634,6 +581,31 @@ const styles = StyleSheet.create({
   },
   editButtonTextDark: {
     color: '#60A5FA',
+  },
+  signOutButton: {
+    marginTop: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(255, 255, 255, 0.92)',
+    borderWidth: 1,
+    borderColor: 'rgba(220, 38, 38, 0.25)',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+  },
+  signOutButtonDark: {
+    backgroundColor: 'rgba(31, 41, 55, 0.92)',
+    borderColor: 'rgba(248, 113, 113, 0.25)',
+  },
+  signOutText: {
+    color: '#DC2626',
+    fontWeight: '800',
+    fontSize: 16,
+  },
+  signOutTextDark: {
+    color: '#FCA5A5',
   },
 });
 

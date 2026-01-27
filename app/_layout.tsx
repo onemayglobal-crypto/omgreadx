@@ -2,11 +2,14 @@ import { DarkTheme, DefaultTheme, ThemeProvider as NavigationThemeProvider } fro
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { Platform } from 'react-native';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import 'react-native-reanimated';
 import '../global.css';
 
 import { ThemeProvider, useTheme } from '@/contexts/ThemeContext';
+import { AuthProvider, useAuth } from '@/contexts/AuthContext';
+import AuthModal from '@/components/auth-modal';
+import { configureGoogleSignIn } from '@/utils/firebaseAuth';
 
 // Component to load Google Fonts for web
 function WebFontLoader() {
@@ -40,6 +43,17 @@ function WebFontLoader() {
 
 function RootLayoutNav() {
   const { theme } = useTheme();
+  const { firebaseUser, authLoading } = useAuth();
+  const [showAuth, setShowAuth] = useState(false);
+
+  useEffect(() => {
+    configureGoogleSignIn().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (authLoading) return;
+    setShowAuth(!firebaseUser);
+  }, [authLoading, firebaseUser]);
 
   return (
     <NavigationThemeProvider value={theme === 'dark' ? DarkTheme : DefaultTheme}>
@@ -47,6 +61,15 @@ function RootLayoutNav() {
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
       </Stack>
+
+      {/* Global auth gate: require sign-in on app open, until sign out */}
+      <AuthModal
+        visible={showAuth}
+        forceAuth
+        onClose={() => setShowAuth(false)}
+        onAuthed={() => setShowAuth(false)}
+      />
+
       <StatusBar style={theme === 'dark' ? 'light' : 'dark'} />
     </NavigationThemeProvider>
   );
@@ -59,8 +82,10 @@ export const unstable_settings = {
 export default function RootLayout() {
   return (
     <ThemeProvider>
-      <WebFontLoader />
-      <RootLayoutNav />
+      <AuthProvider>
+        <WebFontLoader />
+        <RootLayoutNav />
+      </AuthProvider>
     </ThemeProvider>
   );
 }

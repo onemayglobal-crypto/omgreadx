@@ -167,11 +167,7 @@ export default function FileList({ refreshKey }: FileListProps) {
               `Paragraphs: ${stats.completedParagraphs}/${stats.totalParagraphs}\n` +
               `Words: ${stats.totalWords}\n` +
               `Time: ${Math.ceil(stats.readingTime / 60)} Min\n` +
-              `Completion: ${stats.completionPercentage}%`,
-              [{ text: 'OK', onPress: () => {
-                setReadingMode(false);
-                setSelectedFile(null);
-              }}]
+              `Completion: ${stats.completionPercentage}%`
             );
           }}
         />
