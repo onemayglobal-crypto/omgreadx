@@ -215,21 +215,19 @@ export default function FileUpload({ onFileUploaded }: FileUploadProps) {
       const storagePath = `users/${uid}/files/${docId}/original.${ext}`;
       const processedPath = `users/${uid}/processed/${docId}.json`;
 
-      // 2) Create Firestore metadata early only for PDF (processing → ready/error)
-      if (ext === 'pdf') {
-        await upsertUserDocument({
-          uid,
-          docId,
-          data: {
-            type,
-            title,
-            pages: 1,
-            status: 'processing',
-            storagePath,
-            processedPath,
-          },
-        });
-      }
+      // 2) Create Firestore metadata early (processing → ready/error)
+      await upsertUserDocument({
+        uid,
+        docId,
+        data: {
+          type,
+          title,
+          pages: 1,
+          status: 'processing',
+          storagePath,
+          processedPath,
+        },
+      });
 
       let normalized: { uri: string; cleanup: () => Promise<void> } | null = null;
       try {
@@ -244,11 +242,23 @@ export default function FileUpload({ onFileUploaded }: FileUploadProps) {
 
         // 4) For non-PDF types, create processed JSON ourselves (no large text in Firestore)
         if (ext !== 'pdf') {
-          const { convertFileToText } = await import('@/utils/fileConverter');
-          const conversionTimeout = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('File conversion timeout. Please try again.')), 30000)
-          );
-          const text = await Promise.race([convertFileToText(normalized.uri, file.name), conversionTimeout]);
+          let text = '';
+          // TXT/RTF: read directly from file (fast + reliable), fallback to base64 decode
+          if (ext === 'txt' || ext === 'rtf') {
+            try {
+              text = await FileSystem.readAsStringAsync(normalized.uri);
+            } catch {
+              const base64 = await FileSystem.readAsStringAsync(normalized.uri, { encoding: 'base64' } as any);
+              const { base64ToUtf8String } = await import('@/utils/base64');
+              text = base64ToUtf8String(base64);
+            }
+          } else {
+            const { convertFileToText } = await import('@/utils/fileConverter');
+            const conversionTimeout = new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('File conversion timeout. Please try again.')), 30000)
+            );
+            text = await Promise.race([convertFileToText(normalized.uri, file.name), conversionTimeout]);
+          }
           const pages = 1;
           await uploadJsonToStoragePath({ storagePath: processedPath, json: { pages, text } });
 
@@ -314,10 +324,8 @@ export default function FileUpload({ onFileUploaded }: FileUploadProps) {
             status: 'error',
             storagePath,
             processedPath,
-            errorMessage:
-              ext === 'pdf'
-                ? 'PDF processing failed. Please upload a correct PDF format without images.'
-                : 'File processing failed. Please upload only PDF, DOCX, TXT, RTF files.',
+            // Store the real error so we can debug issues in production.
+            errorMessage: msg,
           } as any,
         });
         throw new Error(msg);

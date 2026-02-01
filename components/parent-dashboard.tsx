@@ -196,14 +196,6 @@ export default function ParentDashboard({ refreshKey }: ParentDashboardProps) {
                 color={isDark ? '#FBBF24' : '#6B7280'} 
               />
             </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.resetButton, isDark && styles.resetButtonDark]}
-              onPress={handleResetToday}
-              accessibilityLabel="Reset today's reading data"
-            >
-              <Ionicons name="refresh" size={18} color={isDark ? '#60A5FA' : '#2563EB'} />
-              <Text style={[styles.resetButtonText, isDark && styles.resetButtonTextDark]}>Reset Today</Text>
-            </TouchableOpacity>
           </View>
         </View>
         <Text style={[styles.headerSubtitle, isDark && styles.headerSubtitleDark]}>

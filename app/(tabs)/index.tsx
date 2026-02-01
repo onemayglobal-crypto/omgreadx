@@ -8,10 +8,11 @@ import { ErrorBoundary } from '@/components/error-boundary';
 import { useTheme } from '@/contexts/ThemeContext';
 import { useAuth } from '@/contexts/AuthContext';
 import { listenUserDocuments, type UserDocument } from '@/utils/firestoreDocuments';
-import { downloadJsonFromStoragePath } from '@/utils/firebaseStorageHelpers';
+import { downloadJsonFromStoragePath, uploadJsonToStoragePath } from '@/utils/firebaseStorageHelpers';
 import { upsertUserDocument } from '@/utils/firestoreDocuments';
-import { uploadJsonToStoragePath } from '@/utils/firebaseStorageHelpers';
 import * as FileSystem from 'expo-file-system/legacy';
+import { storage } from '@/utils/firebaseConfig';
+import { getDownloadURL, ref as storageRef } from 'firebase/storage';
 
 const backgroundImage = require('@/assets/images/dashboard.png');
 
@@ -21,7 +22,7 @@ export default function HomeScreen() {
   const [docs, setDocs] = useState<Array<{ id: string; data: UserDocument }>>([]);
   const [selectedDoc, setSelectedDoc] = useState<{ id: string; data: UserDocument } | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
-  const processingRepairAttempted = useRef<Set<string>>(new Set());
+  const processingAttemptCount = useRef<Map<string, number>>(new Map());
   const processingFirstSeen = useRef<Map<string, number>>(new Map());
   
   const isDark = theme === 'dark';
@@ -43,7 +44,11 @@ export default function HomeScreen() {
   // flip it to "ready" once processed JSON exists in Storage.
   useEffect(() => {
     if (!uid) return;
+    let cancelled = false;
+
     const run = async () => {
+      if (cancelled) return;
+
       const candidates = docs.filter(
         (d) =>
           d.data.status === 'processing' &&
@@ -53,13 +58,25 @@ export default function HomeScreen() {
       );
 
       for (const doc of candidates) {
+        if (cancelled) return;
         if (!processingFirstSeen.current.has(doc.id)) {
           processingFirstSeen.current.set(doc.id, Date.now());
         }
+        const attempts = processingAttemptCount.current.get(doc.id) || 0;
+        processingAttemptCount.current.set(doc.id, attempts + 1);
 
-        if (processingRepairAttempted.current.has(doc.id)) continue;
-        processingRepairAttempted.current.add(doc.id);
+        // IMPORTANT: Don't interfere with brand-new uploads that are still converting.
+        // Only attempt repairs for processing docs older than ~90s.
+        const createdAt: any = (doc.data as any).createdAt;
+        const createdMs =
+          typeof createdAt?.toMillis === 'function' ? createdAt.toMillis() : typeof createdAt === 'number' ? createdAt : null;
+        const firstSeen = processingFirstSeen.current.get(doc.id) || Date.now();
+        const ageMs = createdMs ? Date.now() - createdMs : Date.now() - firstSeen;
+        if (ageMs < 90 * 1000) {
+          continue;
+        }
 
+        let processedOk = false;
         try {
           // 1) If processed JSON exists, mark ready.
           try {
@@ -78,7 +95,7 @@ export default function HomeScreen() {
                   processedPath: doc.data.processedPath,
                 },
               });
-              continue;
+              processedOk = true;
             }
           } catch {
             // processed not available yet
@@ -96,7 +113,6 @@ export default function HomeScreen() {
               const blob = await resp.blob();
               const ab = await blob.arrayBuffer();
               const bytes = new Uint8Array(ab);
-              // write as base64
               const { uint8ArrayToBase64 } = await import('@/utils/base64');
               await FileSystem.writeAsStringAsync(tmp, uint8ArrayToBase64(bytes), {
                 encoding: FileSystem.EncodingType.Base64,
@@ -121,7 +137,9 @@ export default function HomeScreen() {
                     processedPath: doc.data.processedPath,
                   },
                 });
-                continue;
+                processedOk = true;
+              } catch {
+                // fall through to error handling below
               } finally {
                 try {
                   await FileSystem.deleteAsync(tmp, { idempotent: true } as any);
@@ -131,15 +149,15 @@ export default function HomeScreen() {
               }
             }
           }
+        } catch {
+          // ignore
+        } finally {
+          if (processedOk) continue;
 
-          // 3) If still processing after a while, mark error so UI doesn't get stuck.
-          const createdAt: any = (doc.data as any).createdAt;
-          const createdMs =
-            typeof createdAt?.toMillis === 'function' ? createdAt.toMillis() : typeof createdAt === 'number' ? createdAt : null;
-          const firstSeen = processingFirstSeen.current.get(doc.id) || Date.now();
-          const ageMs = createdMs ? Date.now() - createdMs : Date.now() - firstSeen;
-          // Non-PDF should never stay in processing; fail fast after 30s.
-          const maxAge = doc.data.type === 'pdf' ? 2 * 60 * 1000 : 30 * 1000;
+          // 3) If still processing after a while or multiple attempts, mark error.
+          // Give non-PDF up to 3 minutes before failing; PDF up to 5 minutes.
+          const maxAge = doc.data.type === 'pdf' ? 5 * 60 * 1000 : 3 * 60 * 1000;
+
           if (ageMs > maxAge) {
             await upsertUserDocument({
               uid,
@@ -158,17 +176,70 @@ export default function HomeScreen() {
               } as any,
             });
           }
-        } catch {
-          // ignore
         }
       }
+
+      if (candidates.length > 0 && !cancelled) {
+        setTimeout(run, 8000);
+      }
     };
+
     run();
+    return () => {
+      cancelled = true;
+    };
   }, [docs, uid]);
 
   const handleUploaded = async (file: UploadedFile) => {
     console.log('File uploaded callback received:', file);
     setRefreshKey(prev => prev + 1);
+  };
+
+  const retryProcessDoc = async (doc: { id: string; data: UserDocument }) => {
+    if (!uid) return;
+    if (!doc.data.storagePath || !doc.data.processedPath) return;
+
+    try {
+      // Download original from Storage to local temp
+      const url = await getDownloadURL(storageRef(storage, doc.data.storagePath));
+      const ext = doc.data.storagePath.split('.').pop() || 'bin';
+      const tmp = `${FileSystem.cacheDirectory || FileSystem.documentDirectory}readx-retry-${doc.id}.${ext}`;
+      await FileSystem.downloadAsync(url, tmp);
+
+      // Convert locally
+      const { convertFileToText } = await import('@/utils/fileConverter');
+      const text = await convertFileToText(tmp, doc.data.title || doc.data.name);
+      await uploadJsonToStoragePath({ storagePath: doc.data.processedPath, json: { pages: 1, text } });
+
+      // Mark ready
+      await upsertUserDocument({
+        uid,
+        docId: doc.id,
+        data: {
+          type: doc.data.type,
+          title: doc.data.title,
+          pages: 1,
+          status: 'ready',
+          storagePath: doc.data.storagePath,
+          processedPath: doc.data.processedPath,
+        },
+      });
+    } catch (e: any) {
+      await upsertUserDocument({
+        uid,
+        docId: doc.id,
+        data: {
+          type: doc.data.type,
+          title: doc.data.title,
+          pages: doc.data.pages || 1,
+          status: 'error',
+          storagePath: doc.data.storagePath,
+          processedPath: doc.data.processedPath,
+          errorMessage: e?.message || 'Processing failed. Please re-upload the file.',
+        } as any,
+      });
+      throw e;
+    }
   };
 
   if (selectedDoc) {
@@ -234,7 +305,23 @@ export default function HomeScreen() {
                     style={[styles.fileItem, isDark && styles.fileItemDark]}
                     onPress={() => {
                       if (item.data.status === 'processing') {
-                        Alert.alert('Processing', 'This document is still processing. Please try again in a moment.');
+                        Alert.alert(
+                          'Processing',
+                          'This document is still processing. Retry now?',
+                          [
+                            { text: 'Cancel', style: 'cancel' },
+                            {
+                              text: 'Retry',
+                              onPress: async () => {
+                                try {
+                                  await retryProcessDoc(item);
+                                } catch {
+                                  Alert.alert('Error', 'Failed to process. Please re-upload the file.');
+                                }
+                              },
+                            },
+                          ]
+                        );
                         return;
                       }
                       if (item.data.status === 'error') {

@@ -275,8 +275,9 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
       console.warn('[FileConverter] File check failed, continuing anyway:', checkError.message);
     }
     
-    // Load file as ArrayBuffer with timeout
-    let arrayBuffer: ArrayBuffer;
+    // Load file as ArrayBuffer/base64 with timeout
+    let arrayBuffer: ArrayBuffer | null = null;
+    let base64Data: string | null = null;
     try {
       const timeoutDuration = Platform.OS === 'web' ? 30000 : 60000;
       const loadPromise = (async () => {
@@ -284,24 +285,24 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
         if (fileUri.startsWith('data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,') ||
             fileUri.startsWith('data:application/msword;base64,')) {
           console.log('[FileConverter] Detected base64 data URI for DOCX');
-          const base64Data = fileUri.split(',')[1];
+          base64Data = fileUri.split(',')[1];
           return base64ToUint8Array(base64Data).buffer;
         } else if (fileUri.startsWith('data:')) {
           // Generic data URI - try to extract base64
           console.log('[FileConverter] Detected generic data URI for DOCX, attempting to extract base64');
           const base64Match = fileUri.match(/data:[^;]*;base64,(.+)/);
           if (base64Match) {
-            const base64Data = base64Match[1];
+            base64Data = base64Match[1];
             return base64ToUint8Array(base64Data).buffer;
           } else {
             throw new Error('Invalid data URI format for DOCX');
           }
         } else if (Platform.OS === 'ios' || Platform.OS === 'android') {
-          // Mobile: prefer FileSystem base64 (stable for local file:// URIs)
-          const fileBase64 = await FileSystem.readAsStringAsync(fileUri, {
+          // Mobile: read base64 (stable for local file:// URIs)
+          base64Data = await FileSystem.readAsStringAsync(fileUri, {
             encoding: 'base64',
           } as any);
-          return base64ToUint8Array(fileBase64).buffer;
+          return base64ToUint8Array(base64Data).buffer;
         } else {
           // Web: Try fetch first
           try {
@@ -309,10 +310,10 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
             return await response.arrayBuffer();
           } catch {
             // Fallback to FileSystem
-            const fileBase64 = await FileSystem.readAsStringAsync(fileUri, {
+            base64Data = await FileSystem.readAsStringAsync(fileUri, {
               encoding: 'base64',
             } as any);
-            return base64ToUint8Array(fileBase64).buffer;
+            return base64ToUint8Array(base64Data).buffer;
           }
         }
       })();
@@ -330,7 +331,11 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
     let extractedText = '';
     try {
       const JSZip = (await import('jszip')).default;
-      const zip = await JSZip.loadAsync(arrayBuffer);
+      // On mobile, prefer base64 load (avoids arrayBuffer issues)
+      const zip =
+        Platform.OS !== 'web' && base64Data
+          ? await JSZip.loadAsync(base64Data, { base64: true })
+          : await JSZip.loadAsync(arrayBuffer as ArrayBuffer);
       const docXml = await zip.file('word/document.xml')?.async('string');
       if (docXml) {
         extractedText = docXml
@@ -338,12 +343,12 @@ async function extractTextFromDOCX(fileUri: string): Promise<string> {
           .replace(/\s+/g, ' ')
           .trim();
       }
-    } catch (zipError) {
+    } catch (zipError: any) {
       console.warn('[FileConverter] DOCX zip extraction failed:', zipError);
     }
 
-    // On native, avoid mammoth if we already got text
-    if (Platform.OS !== 'web' && extractedText.trim().length > 0) {
+    // If ZIP extraction succeeded, return early (fast path on mobile too).
+    if (extractedText.trim().length > 0) {
       console.log(`[FileConverter] Extracted ${extractedText.length} characters from DOCX (zip)`);
       return extractedText;
     }
